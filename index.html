@@ -2221,6 +2221,9 @@ if (modeBtn){
 
 
 //怪獸插件開始
+
+
+
 <!-- ============ Plugin: 西方黑魔龍 v2（巡邏：編輯模式也會動；追擊需遊玩+視線） ============ -->
 <script>
 (() => {
@@ -2653,6 +2656,523 @@ if (modeBtn){
 })();
 </script>
 <!-- ============ /Plugin: 西方黑魔龍結束v2 ============ -->
+
+<!-- ============ Plugin: 暴龍 T-REX v1.2（強制用 spritesheet；貼地巡邏／追擊＋咬擊＋血花FX＋掉落） ============ -->
+<script>
+(() => {
+  'use strict';
+
+  const ENT  = window.ENT  || (window.ENT  = {});
+  const SKIN = window.SKIN || (window.SKIN = { ent:{ get:()=>null }, useEnt:()=>{} });
+
+  /* ===== 使用者可調：精靈圖設定 ===== */
+  const SHEET_URL  = 'assets/rex.png'; // ← 你的 PNG 路徑（預設 assets/rex.png）
+  const SHEET_COLS = 6;                // 欄數
+  const SHEET_ROWS = 5;                // 列數
+  const DRAW_SCALE = 2.0;              // 繪製縮放倍率
+
+  /* ========== 世界快照（供碰撞與尺寸） ========== */
+  const SAVEK = 'dd_skel_phase1';
+  let _rawCache=null, _world=null, _lastSnap=0;
+
+  function loadWorldSnapshot(force=false){
+    const now = performance.now();
+    if(!force && now - _lastSnap < 450) return _world;
+    const raw = localStorage.getItem(SAVEK) || '';
+    if(!force && raw === _rawCache) return _world;
+    _lastSnap = now; _rawCache = raw;
+    try{
+      const d = JSON.parse(raw || '{}');
+      const tiles = (d.tileRows||[]).map(r=>r.split(''));
+      const T = d.tileSize || 48;
+      _world = {
+        w: d.w || 40, h: d.h || 24, T, tiles,
+        tileAt(gx,gy){
+          if(gx<0||gy<0||gx>=this.w||gy>=this.h) return '#';
+          const row=this.tiles[gy]||[]; return row[gx]||'.';
+        },
+        isSolidRect(rx,ry,rw,rh){
+          const T=this.T;
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++){
+            for(let x=x0;x<=x1;x++){
+              if(this.tileAt(x,y)==='#') return true;
+            }
+          }
+          return false;
+        }
+      };
+    }catch{
+      _world = { w:40, h:24, T:48, tiles:[],
+        tileAt(){return '.';}, isSolidRect(){return false;}
+      };
+    }
+    return _world;
+  }
+
+  /* ========== 碰撞移動 ========== */
+  function moveWithCollisions(o, dt){
+    const W = loadWorldSnapshot(); if(!W) return;
+    // X
+    let nx = o.x + o.vx*dt;
+    if(!W.isSolidRect(nx, o.y, o.w, o.h)){ o.x = nx; }
+    else{
+      const dir = Math.sign(o.vx)||1;
+      let px=o.x; while(!W.isSolidRect(px+dir, o.y, o.w, o.h)) px+=dir;
+      o.x=px; o.vx=0;
+    }
+    // Y
+    let ny = o.y + o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x, ny, o.w, o.h)){ o.y = ny; }
+    else{
+      const dir = Math.sign(o.vy)||1;
+      let py=o.y; while(!W.isSolidRect(o.x, py+dir, o.w, o.h)) py+=dir;
+      o.y=py; if(dir>0) o.onGround=true; o.vy=0;
+    }
+    // 邊界
+    const maxX=W.w*W.T - o.w, maxY=W.h*W.T - o.h;
+    o.x = Math.max(0, Math.min(maxX, o.x));
+    o.y = Math.max(0, Math.min(maxY, o.y));
+  }
+
+  /* ========== 視線（LOS） ========== */
+  function hasLineOfSight(ax,ay,bx,by,W){
+    const dx=bx-ax, dy=by-ay;
+    const dist = Math.hypot(dx,dy)||1;
+    const step = Math.max(4, Math.floor(W.T*0.5));
+    const steps = Math.ceil(dist/step);
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const x = ax + dx*t, y = ay + dy*t;
+      const gx = Math.floor(x/W.T), gy = Math.floor(y/W.T);
+      if(W.tileAt(gx,gy)==='#') return false;
+    }
+    return true;
+  }
+
+  /* ========== 掉落 ========== */
+  const TREX_DROP = {
+    coins: { chance: 0.75, min:2, max:5, color:'rgba(255,211,78,0.9)' },
+    loot:  { chance: 0.40, min:1, max:2, color:'rgba(160,200,255,0.95)'},
+    meat:  { chance: 0.50, min:1, max:1, color:'rgba(200,40,40,0.95)'}
+  };
+  const R = (a,b)=>Math.floor(a + Math.random()*(b-a+1));
+  function trexDropLootAt(x,y){
+    const INV = window.INVENTORY || (window.INVENTORY = {meat:0, loot:0, coins:0});
+    let msg=[];
+    for(const [k,cfg] of Object.entries(TREX_DROP)){
+      if(Math.random()<=cfg.chance){
+        const n = R(cfg.min, cfg.max);
+        INV[k] = (INV[k]|0) + n;
+        msg.push((k==='coins'?'🪙':'meat'===k?'🍖':'🎁')+'x'+n);
+        try{
+          if(SKIN.spawnFx){
+            for(let i=0;i<n;i++){
+              SKIN.spawnFx({ x:x+(Math.random()*12-6), y:y-6,
+                vx:(Math.random()*80-40), vy:-60-Math.random()*60,
+                r: k==='meat'?4:5, color:cfg.color, life:0.5, maxLife:0.5 });
+            }
+          }
+        }catch{}
+      }
+    }
+    const box = document.getElementById('toastBox');
+    if(box && msg.length){
+      box.textContent = `獲得 ${msg.join(' ')}`;
+      box.style.background='#000b'; box.style.padding='8px 12px'; box.style.borderRadius='8px';
+      clearTimeout(trexDropLootAt._t); trexDropLootAt._t = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+    if(typeof window.refreshBag === 'function') window.refreshBag();
+  }
+
+  /* ========== 血花 FX（用 SKIN.spawnFx；若無則靜默） ========== */
+  function bloodBurst(x,y,dirX=1,dirY=0,power=1){
+    try{
+      if(!SKIN.spawnFx) return;
+      const N = Math.floor(16 + 10*power);
+      for(let i=0;i<N;i++){
+        const ang = Math.atan2(dirY,dirX) + (Math.random()*0.9 - 0.45);
+        const spd = 110 + Math.random()*260 * power;
+        SKIN.spawnFx({
+          x, y,
+          vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd - (40 + Math.random()*60),
+          r: 2 + Math.random()*3.5,
+          color: (['rgba(210,20,20,0.95)','rgba(170,10,10,0.90)','rgba(120,0,0,0.85)','rgba(255,80,60,0.80)'])[(Math.random()*4)|0],
+          life: 0.22 + Math.random()*0.26, maxLife: 0.22 + Math.random()*0.26
+        });
+      }
+      for(let i=0;i<5;i++){
+        SKIN.spawnFx({ x: x+(Math.random()*26-13), y: y+(Math.random()*10+6),
+          vx:0, vy:0, r: 6+Math.random()*10, color:'rgba(120,0,0,0.55)',
+          life: 1.2 + Math.random()*0.8, maxLife: 1.2 + Math.random()*0.8 });
+      }
+    }catch{}
+  }
+
+  /* ========== Spritesheet 註冊與畫法 ========== */
+  const SHEETS = (SKIN.sheets ||= {});
+  function registerTrexSheet(url, cols, rows, name='trex_sheet'){
+    // 若已註冊且 ready，就直接回傳
+    if(SHEETS[name]?.ready) return name;
+    const img = new Image(); img.src = url;
+    SHEETS[name] = { img, cols, rows, ready:false };
+    img.onload = ()=>{ SHEETS[name].ready = true; };
+    return name;
+  }
+  window.registerTrexSheet = registerTrexSheet;
+
+  function makeTrexDrawer(sheetName='trex_sheet', scale=DRAW_SCALE){
+    return function drawTrex(ctx, e, now){
+      const sh = SHEETS[sheetName];
+      if(!sh || !sh.ready) return drawTrexPlaceholder(ctx, e, now);
+      e._anim ||= {
+        name:'idle', i:0,
+        map:{
+          idle:  { frames:[0,1,2,3],      fps:6,  loop:true  },
+          walk:  { frames:[4,5,6,7,8,9],  fps:9,  loop:true  },
+          roar:  { frames:[10,11,12,13],  fps:6,  loop:false, next:'walk' },
+          bite:  { frames:[14,15,16,17,18,19], fps:12, loop:false, next:'walk', hit:[17,18] },
+          hurt:  { frames:[20,21],        fps:10, loop:false, next:'walk' },
+          dead:  { frames:[22,23,24,25,26,27], fps:8, loop:false }
+        }
+      };
+      const dt = e._dt||0.016;
+      const A  = e._anim.map[e._anim.name] || e._anim.map.walk;
+      e._anim.i += A.fps*dt;
+      let idx = Math.floor(e._anim.i);
+      const end = !A.loop && (idx >= A.frames.length);
+      if(end){ e._anim.name = A.next || 'walk'; e._anim.i=0; idx=0; }
+      const frame = A.frames[idx % A.frames.length];
+
+      const cols = sh.cols|0||SHEET_COLS, rows = sh.rows|0||SHEET_ROWS;
+      const fw = sh.img.width/cols, fh = sh.img.height/rows;
+      const sx = (frame%cols)*fw, sy = Math.floor(frame/cols)*fh;
+
+      const drawW = Math.max(fw*scale, e.w*1.4);
+      const drawH = Math.max(fh*scale, e.h*1.2);
+
+      ctx.save();
+      if(e._flash>0){ ctx.globalAlpha = 0.65; e._flash--; }
+      ctx.translate(e.x + e.w/2, e.y + e.h);
+      ctx.scale(e.face>=0 ? 1 : -1, 1);
+      ctx.drawImage(sh.img, sx, sy, fw, fh, -drawW/2, -drawH, drawW, drawH);
+      ctx.restore();
+    };
+  }
+  window.makeTrexDrawer = makeTrexDrawer;
+
+  function drawTrexPlaceholder(ctx,e,t){
+    const cx=e.x+e.w/2, cy=e.y+e.h;
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.28)'; ctx.beginPath(); ctx.ellipse(cx, cy, e.w*0.45, e.h*0.16, 0,0,Math.PI*2); ctx.fill();
+    ctx.translate(cx, cy); ctx.scale(e.face>=0?1:-1,1);
+    ctx.fillStyle='#2b513a'; ctx.fillRect(-e.w*0.6, -e.h*0.9, e.w*1.2, e.h*0.9);
+    ctx.fillStyle='#4b7a58'; ctx.fillRect(-e.w*0.2, -e.h*1.2, e.w*0.6, e.h*0.4);
+    ctx.fillStyle='#9d2b2b'; ctx.fillRect(e.w*0.3, -e.h*1.05, 10, 6);
+    ctx.restore();
+  }
+
+  /* ========== 只在遊玩模式安全取得玩家 ========== */
+  function getPlayerIfPlaying(){
+    try{
+      if (typeof window.__getMode === 'function' && window.__getMode() === 'play' &&
+          typeof window.__ensurePlayer === 'function'){
+        return window.__ensurePlayer();
+      }
+    }catch{}
+    return null;
+  }
+
+  /* ========== 暴龍（貼地 AI） ========== */
+  const TREX_BASE = {
+    label:'暴龍',
+    kind:'monster',
+    ai:'trex',
+    stats:{
+      hp: 220, atk: 18, def: 4,
+      spd: 140, patrolSpd: 90,
+      biteCD: 0.8, touchCD: 0.60,
+      biteRange: 64, knockVx: 380, knockVy: 520
+    }
+  };
+
+  ENT.trex = {
+    label: TREX_BASE.label,
+    kind:  TREX_BASE.kind,
+    ai:    TREX_BASE.ai,
+    stats: { ...TREX_BASE.stats },
+
+    spawn(opts={}){
+      const W = loadWorldSnapshot(); const T=W?W.T:48;
+      const e = {
+        x: opts.x||0, y: opts.y||0, vx:0, vy:0, face:1,
+        hp: (typeof opts.hp==='number')?opts.hp:TREX_BASE.stats.hp,
+        sizeTiles: opts.sizeTiles || { w:3, h:2 },
+        detectRadiusM: opts.detectRadiusM || 15,
+        metersPerTile: opts.metersPerTile || 1,
+        patrolSpanTiles: opts.patrolSpanTiles || 3
+      };
+      return e;
+    },
+
+    render(ctx, e){
+      const now = performance.now()/1000;
+      const dt  = Math.min(0.033, Math.max(0.001, now - (e._last||now)));
+      e._last   = now; e._dt = dt;
+
+      if(e._dead){
+        if(!e._dieAt) e._dieAt = now;
+        if(now - e._dieAt > 0.60){ e.x = e.y = -1e6; e.w = e.h = 0; e.vx = e.vy = 0; }
+        return;
+      }
+
+      const W = loadWorldSnapshot(); if(!W) return;
+
+      if(!e._init){
+        e._init = true;
+        e.hp = (typeof e.hp==='number') ? e.hp : TREX_BASE.stats.hp;
+        const T=W.T;
+        e.w = Math.floor((e.sizeTiles?.w||3) * T * 0.75);
+        e.h = Math.floor((e.sizeTiles?.h||2) * T * 0.80);
+        e.vx ||= 0; e.vy ||= 0; e.face ||= 1; e._cool ||= 0; e._biteCD=0;
+        e._state='patrol';
+        e._spawn = { x:e.x, y:e.y };
+        e._dir = Math.random()<0.5 ? -1 : 1;
+        e._span = (e.patrolSpanTiles||3) * T;
+        e._metersPerTile = e.metersPerTile || 1;
+      }
+
+      // 重力
+      const GRAV = 1800; e.vy += GRAV * dt;
+
+      // 視野/玩家
+      const meterToPx = W.T / (e._metersPerTile || 1);
+      const radiusPx  = (e.detectRadiusM || 15) * meterToPx;
+      const p = getPlayerIfPlaying();
+      const ex=e.x+e.w/2, ey=e.y+e.h/2;
+      let dx=0, dy=0, dist=1e9, canSee=false;
+
+      if(p){
+        const px=p.x+p.w/2, py=p.y+p.h/2;
+        dx=px-ex; dy=py-ey; dist=Math.hypot(dx,dy);
+        canSee = (dist<=radiusPx) && hasLineOfSight(ex,ey, px,py, W);
+      }
+
+      // AI
+      if(e._state==='patrol'){
+        const targetX = e._spawn.x + e._dir * e._span;
+        const dir = Math.sign(targetX - e.x) || e._dir;
+        e.vx = dir * TREX_BASE.stats.patrolSpd;
+
+        moveWithCollisions(e, dt);
+        if(e.onGround && e.vy>0) e.vy = 0;
+        e.face = (e.vx>=0 ? 1 : -1);
+
+        if(Math.abs(e.x - targetX) < 6 || W.isSolidRect(e.x + dir*8, e.y, e.w, e.h)) e._dir *= -1;
+
+        if(canSee){ e._state='chase'; if(e._anim){ e._anim.name='walk'; e._anim.i=0; } }
+      }
+      else if(e._state==='chase'){
+        if(!p){ e._state='patrol'; if(e._anim){ e._anim.name='idle'; e._anim.i=0; } }
+        else{
+          if(canSee){
+            e._lostT=0;
+            const dir = (dx>=0)?1:-1;
+            e.vx = dir * TREX_BASE.stats.spd;
+            e.face = dir>0?1:-1;
+
+            if(e._biteCD>0) e._biteCD -= dt;
+
+            moveWithCollisions(e, dt);
+            if(e.onGround && e.vy>0) e.vy = 0;
+
+            // 咬擊
+            if(dist <= TREX_BASE.stats.biteRange && e._biteCD<=0){
+              e._biteCD = TREX_BASE.stats.biteCD;
+              if(e._anim){ e._anim.name='bite'; e._anim.i=0; }
+              setTimeout(()=> {
+                if(!p) return;
+                const px=p.x+p.w/2, py=p.y+p.h/2;
+                const hit = Math.hypot(px-(e.x+(e.face>0?e.w+18:-18)), py-(e.y+e.h*0.5)) <= TREX_BASE.stats.biteRange*0.75;
+                if(hit){
+                  if(typeof window.__applyDamageToPlayer==='function'){
+                    window.__applyDamageToPlayer(TREX_BASE.stats.atk);
+                  }else if(ENT.player?.stats){
+                    const ps = ENT.player.stats;
+                    const taken = Math.max(1, TREX_BASE.stats.atk - (ps.def||0));
+                    ps.hp = Math.max(0, ps.hp - taken);
+                  }
+                  const dir2 = (px>ex)?1:-1;
+                  p.vx = dir2 * TREX_BASE.stats.knockVx;
+                  p.vy = -TREX_BASE.stats.knockVy;
+                  bloodBurst(px, py, dir2, 0, 0.9);
+                }
+              }, 120);
+            }
+          }else{
+            e._lostT = (e._lostT||0) + dt;
+            if(e._lostT > 1.2){ e._state='patrol'; e._lostT=0; if(e._anim){e._anim.name='idle'; e._anim.i=0;} }
+            else{
+              const dir = Math.sign(dx)||e.face;
+              e.vx = dir*(TREX_BASE.stats.patrolSpd*0.8);
+              moveWithCollisions(e, dt);
+              if(e.onGround && e.vy>0) e.vy = 0;
+            }
+          }
+        }
+      }
+
+      // 被玩家打到（DD_HITBOX）
+      if (!e._hb && window.DD_HITBOX){
+        e._hb = DD_HITBOX.track(e, {
+          team: 'enemy',
+          getBounds: ()=>({ x:e.x, y:e.y, w:e.w, h:e.h }),
+          getHP: ()=> e.hp,
+          setHP: v => { e.hp = v; },
+          iframes: 0.18,
+          knock: { force: 480 },
+          getVel: ()=>({ vx:e.vx||0, vy:e.vy||0 }),
+          setVel: (vx,vy)=>{ e.vx=vx; e.vy=vy; },
+          onHit:   (en,info)=>{ en._flash = 8; if(en._anim){ en._anim.name='hurt'; en._anim.i=0; }
+                                bloodBurst(en.x+en.w/2, en.y+en.h*0.6, (info?.dirX)||-en.face, 0, 1.0); },
+          onDeath: (en)=>{ const cx=en.x+en.w/2, cy=en.y+en.h*0.6;
+                           trexDropLootAt(cx, cy);
+                           try{ if(SKIN.spawnFx){
+                             SKIN.spawnFx({ x:cx, y:cy, r:24, vx:0, vy:-60, color:'rgba(255,200,40,0.95)', life:0.30, maxLife:0.30 });
+                             SKIN.spawnFx({ x:cx, y:cy, r:18, vx:0, vy:0,   color:'rgba(110,0,0,0.85)',    life:0.22, maxLife:0.22 });
+                           }}catch{}
+                           en._dead = true; if(en._anim){ en._anim.name='dead'; en._anim.i=0; } }
+        });
+      }
+
+      // 視覺：spritesheet 或佔位
+      const drawer = SKIN && SKIN.ent && SKIN.ent.get && SKIN.ent.get('trex');
+      if (typeof drawer === 'function'){
+        try{ drawer(ctx, e, now, window.THEME); return; }catch{}
+      }
+      drawTrexPlaceholder(ctx, e, now);
+    }
+  };
+
+  /* ========== 啟用：註冊圖集 + 強制覆蓋畫法（含快取破壞碼；載入後再套） ========== */
+  const bust = (SHEET_URL.includes('?') ? '&' : '?') + 'v=' + Date.now();
+  const SHEET_NAME = registerTrexSheet(SHEET_URL + bust, SHEET_COLS, SHEET_ROWS);
+
+  function applyTrexDrawer(){
+    try{
+      if (window.SKIN && typeof SKIN.useEnt === 'function'){
+        SKIN.useEnt('trex', makeTrexDrawer(SHEET_NAME, DRAW_SCALE)); // ★ 強制覆蓋
+        console.log('[T-REX] spritesheet drawer 已套用：', SHEET_URL);
+      }
+      window.dispatchEvent(new Event('dd:skin-updated'));
+      const monsBtn = document.querySelector('#palette .pill[data-cat="monsters"]');
+      if (monsBtn && monsBtn.classList.contains('active')) monsBtn.click();
+    }catch(err){ console.warn('[T-REX] 套用畫法失敗', err); }
+  }
+
+  try{
+    const sh = (window.SKIN?.sheets || {})[SHEET_NAME];
+    if (sh?.img?.complete) applyTrexDrawer();
+    else sh?.img?.addEventListener('load', applyTrexDrawer, { once:true });
+  }catch{ applyTrexDrawer(); }
+
+})();
+</script>
+
+
+<script>
+(() => {
+  // 依你的實際路徑/格數調整
+  const SHEET_URL  = 'assets/rex.png';
+  const SHEET_COLS = 6;
+  const SHEET_ROWS = 5;
+  const DRAW_SCALE = 2.0;
+
+  // 1) 註冊 spritesheet（加 cache-bust）
+  const bust = (SHEET_URL.includes('?') ? '&' : '?') + 'v=' + Date.now();
+  const SHEET_NAME = (window.registerTrexSheet
+    ? registerTrexSheet(SHEET_URL + bust, SHEET_COLS, SHEET_ROWS)
+    : 'trex_sheet');
+
+  // 2) 建立 drawer（真正畫圖的函式）
+  const __trex_drawer = (window.makeTrexDrawer
+    ? makeTrexDrawer(SHEET_NAME, DRAW_SCALE)
+    : null);
+
+  // 3) 相容性：不論你的 SKIN.useEnt 需要 function 或 {draw} 物件，都塞得進去
+  function applyTrexDrawerCompat() {
+    try {
+      if (!window.SKIN) return;
+      const entry = (typeof __trex_drawer === 'function')
+        ? __trex_drawer
+        : (v)=>v; // Safety
+
+      // A) 嘗試函式版
+      try { SKIN.useEnt && SKIN.useEnt('trex', entry); } catch {}
+
+      // B) 若系統用物件版（get('trex')回傳object），再用物件形式覆寫一次
+      const got = SKIN?.ent?.get && SKIN.ent.get('trex');
+      if (got && typeof got !== 'function') {
+        const obj = { ...(got||{}), draw: __trex_drawer, name: (got.name || 'trex') };
+        SKIN.useEnt && SKIN.useEnt('trex', obj);
+      }
+
+      // C) palette刷新（若怪物分頁已開）
+      const monsBtn = document.querySelector('#palette .pill[data-cat="monsters"]');
+      if (monsBtn && monsBtn.classList.contains('active')) monsBtn.click();
+    } catch (e) {
+      console.warn('[T-REX] applyTrexDrawerCompat failed:', e);
+    }
+  }
+
+  // 4) 等圖片 ready 再套；若已載好則立刻套
+  try {
+    const sh = (SKIN?.sheets || {})[SHEET_NAME];
+    if (sh?.img?.complete) applyTrexDrawerCompat();
+    else sh?.img?.addEventListener('load', applyTrexDrawerCompat, { once: true });
+  } catch {
+    applyTrexDrawerCompat();
+  }
+
+  // 5) 防呆：模式切換/頁面返回時再套一次，避免被其他插件反覆覆寫
+  window.addEventListener('dd:mode-change', applyTrexDrawerCompat);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) applyTrexDrawerCompat(); });
+
+  // 6) 手動救援鈕（想手動重套就在 Console 打這行）
+  window.__trex_reapply = applyTrexDrawerCompat;
+
+  // 7) 渲染端也加相容讀取：若 get('trex') 回傳物件，就呼叫 .draw/.render
+  //    ——這段會注入一個小代理，讓 ENT.trex.render 在找不到函式時也能畫
+  const _origRender = window.ENT?.trex?.render;
+  if (typeof _origRender === 'function') {
+    window.ENT.trex.render = function(ctx, e) {
+      // 先跑原本邏輯（含AI/物理）
+      _origRender.apply(this, arguments);
+
+      // 如果原本邏輯最後用的是佔位圖，這裡再嘗試直接畫 spritesheet（防止取到的是物件）
+      try {
+        const got = SKIN?.ent?.get && SKIN.ent.get('trex');
+        let drawer = null;
+        if (typeof got === 'function') drawer = got;
+        else if (got && typeof got.draw === 'function') drawer = got.draw;
+        else if (got && typeof got.render === 'function') drawer = got.render;
+        // fallback：直接用我們剛造的 drawer
+        if (!drawer && typeof __trex_drawer === 'function') drawer = __trex_drawer;
+
+        // 可以畫的話就畫（覆蓋佔位）
+        if (typeof drawer === 'function') {
+          const now = performance.now() / 1000;
+          drawer(ctx, e, now);
+        }
+      } catch {}
+    };
+  }
+})();
+</script>
+
+
+<!-- ============ /Plugin: 暴龍 T-REX v1.2 結束 ============ -->
 
 
 <!-- ============ Plugin: 史萊姆（可合體：低血時聚集→巨大化） ============ -->
@@ -3566,6 +4086,452 @@ if (modeBtn){
 })();
 </script>
 //倉鼠插件結束
+
+
+<!-- ============ Plugin: 熊（Bear｜Critters｜側身細長版，含完整AI） ============ -->
+<script>
+(()=>{ 'use strict';
+  /* ======================== 全域接口 ======================== */
+  const ENT  = (window.ENT  ||= {});
+  const SKIN = (window.SKIN ||= { ent:{ map:new Map(), get(k){return this.map.get(k)}, set(k,v){this.map.set(k,v)} }, useEnt(k,fn){ this.ent.set(k,fn) } });
+
+  /* ======================== 參數 ======================== */
+  const CFG = {
+    saveKey: 'dd_skel_phase1',
+    worldSnapCooldownMs: 450,
+    gravity: 980, bounce: 0.08,
+
+    base: {
+      hp: 80,
+      atkSwipe: 14, atkCharge: 20,
+      spd: 70, chaseSpd: 135,
+      touchCD: 0.9,
+      swipeRangePx: 46,
+      chargeMinPx: 120, chargeMaxPx: 360,
+      chargeDur: 0.8, chargeSpd: 260,
+      knockSwipe: { vx:320, vy:420 },
+      knockCharge:{ vx:480, vy:520 }
+    },
+
+    drop: {
+      loot: { chance:0.35, min:1, max:2, color:'rgba(160,200,255,0.95)' },
+      meat: { chance:0.55, min:1, max:2, color:'rgba(200,120,90,0.95)' }
+    },
+
+    paletteCat: 'critters' // 你的分頁（也會容忍 "Critters"）
+  };
+
+  /* ======================== 世界快照 ======================== */
+  let _rawCache=null, _world=null, _lastSnap=0;
+  function loadWorldSnapshot(force=false){
+    const now=performance.now();
+    if(!force && now-_lastSnap<CFG.worldSnapCooldownMs) return _world;
+    const raw = localStorage.getItem(CFG.saveKey)||'';
+    if(!force && raw===_rawCache) return _world;
+    _lastSnap=now; _rawCache=raw;
+    try{
+      const d = JSON.parse(raw||'{}');
+      const tiles = (d.tileRows||[]).map(r=>r.split(''));
+      const T = d.tileSize||48;
+      _world = {
+        w:d.w||40, h:d.h||24, T, tiles,
+        tileAt(gx,gy){ if(gx<0||gy<0||gx>=this.w||gy>=this.h) return '#'; const row=this.tiles[gy]||[]; return row[gx]||'.'; },
+        isSolidRect(rx,ry,rw,rh){
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++){ for(let x=x0;x<=x1;x++){ if(this.tileAt(x,y)==='#') return true; } }
+          return false;
+        }
+      };
+    }catch{
+      _world = { w:40,h:24,T:48, tiles:[], tileAt(){return '.'}, isSolidRect(){return false} };
+    }
+    return _world;
+  }
+
+  /* ======================== 移動/碰撞 ======================== */
+  function moveWithCollisions(o, dt){
+    const W = loadWorldSnapshot(); if(!W) return;
+    // X
+    let nx = o.x + (o.vx||0)*dt;
+    if(!W.isSolidRect(nx, o.y, o.w, o.h)){ o.x = nx; }
+    else{
+      const dir = Math.sign(o.vx||0)||1;
+      let px=o.x; while(!W.isSolidRect(px+dir, o.y, o.w, o.h)) px+=dir;
+      o.x=px; o.vx=0;
+    }
+    // Y
+    o.vy = (o.vy||0) + (o._grav||CFG.gravity)*dt;
+    let ny = o.y + o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x, ny, o.w, o.h)){ o.y = ny; }
+    else{
+      const dir = Math.sign(o.vy||0)||1;
+      let py=o.y; while(!W.isSolidRect(o.x, py+dir, o.w, o.h)) py+=dir;
+      o.y=py;
+      if(dir>0){
+        o.onGround=true;
+        o.vy = -Math.abs(o.vy) * (o._bounce||CFG.bounce);
+        if(Math.abs(o.vy)<30) o.vy=0;
+      } else o.vy=0;
+    }
+    // 邊界
+    const maxX = _world.w*_world.T - o.w, maxY = _world.h*_world.T - o.h;
+    o.x = Math.max(0, Math.min(maxX, o.x));
+    o.y = Math.max(0, Math.min(maxY, o.y));
+  }
+
+  /* ======================== LOS ======================== */
+  function hasLOS(ax,ay,bx,by,W){
+    const dx=bx-ax, dy=by-ay, dist=Math.hypot(dx,dy)||1;
+    const step=Math.max(4, Math.floor((W?.T||48)*0.5)), n=Math.ceil(dist/step);
+    for(let i=0;i<=n;i++){ const t=i/n, x=ax+dx*t, y=ay+dy*t; const gx=Math.floor(x/(W?.T||48)), gy=Math.floor(y/(W?.T||48)); if(W.tileAt(gx,gy)==='#') return false; }
+    return true;
+  }
+
+  /* ======================== 掉落 ======================== */
+  function randInt(a,b){ return Math.floor(a + Math.random()*(b-a+1)); }
+  function tryDrop(kind, inv, x, y, color, cfg){
+    if(Math.random() > cfg.chance) return 0;
+    const n = randInt(cfg.min, cfg.max);
+    const key = (kind==='coin'?'coins':kind);
+    inv[key] = (inv[key]|0) + n;
+    try{
+      if(SKIN && SKIN.spawnFx){
+        for(let i=0;i<n;i++){
+          SKIN.spawnFx({ x:x+(Math.random()*12-6), y:y-6, vx:(Math.random()*80-40), vy:-60-Math.random()*60,
+            r: 5, color, life:0.6, maxLife:0.6 });
+        }
+      }
+    }catch{}
+    return n;
+  }
+  function dropLootAt(x,y){
+    const INV = (window.INVENTORY ||= {meat:0, loot:0, coins:0});
+    const l = tryDrop('loot', INV, x,y, CFG.drop.loot.color, CFG.drop.loot);
+    const m = tryDrop('meat', INV, x,y, CFG.drop.meat.color, CFG.drop.meat);
+    const box = document.getElementById('toastBox');
+    if(box && (l||m)){
+      let msg=''; if(l) msg+=`🎁x${l} `; if(m) msg+=`🍖x${m}`;
+      box.textContent = `獲得 ${msg.trim()}`;
+      box.style.background='#000b'; box.style.padding='8px 12px'; box.style.borderRadius='8px';
+      clearTimeout(dropLootAt._t); dropLootAt._t = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+    if(typeof window.refreshBag==='function') window.refreshBag();
+  }
+
+  /* ======================== 視覺：側身細長熊 ======================== */
+  const PALETTE = {
+    furDark:   'rgba(95,60,40,0.95)',
+    furMid:    'rgba(130,85,55,0.95)',
+    furLight:  'rgba(170,120,85,0.95)',
+    belly:     'rgba(190,150,115,0.95)',
+    nose:      '#2b1a12',
+    eye:       '#1a0e08',
+    claw:      'rgba(240,230,220,0.95)',
+    shadow:    'rgba(0,0,0,0.25)'
+  };
+
+  function drawBearSidePlaceholder(ctx, e, t){
+    const W = Math.max(48, e.w || 96);
+    const H = Math.max(36, e.h || 64);
+    const cx = e.x + e.w/2, cy = e.y + e.h/2;
+
+    // 地影
+    ctx.save();
+    ctx.fillStyle = PALETTE.shadow;
+    ctx.beginPath(); ctx.ellipse(e.x + e.w/2, e.y + e.h, Math.max(18, e.w*0.48), Math.max(8, e.h*0.18), 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    const step = Math.sin(t*6), step2 = Math.sin(t*6 + Math.PI), lift = Math.max(0, Math.sin(t*6)*6);
+    ctx.save();
+    const face = (e.face || 1) >= 0 ? 1 : -1;
+    ctx.translate(cx, cy - 2 + Math.sin(t*4)*1.5);
+    ctx.scale(face, 1);
+
+    // 身體（細長）
+    const bodyW = W * 0.95, bodyH = H * 0.60, bodyX = -bodyW*0.10;
+    ctx.save();
+    const gBody = ctx.createLinearGradient(-bodyW/2, 0, bodyW/2, 0);
+    gBody.addColorStop(0, PALETTE.furMid); gBody.addColorStop(1, PALETTE.furDark);
+    ctx.fillStyle = gBody;
+    ctx.beginPath(); ctx.ellipse(bodyX, -6+lift*0.15, bodyW*0.50, bodyH*0.52, 0, 0, Math.PI*2); ctx.fill();
+    // 腹部
+    ctx.fillStyle = PALETTE.belly;
+    ctx.beginPath(); ctx.ellipse(bodyX + bodyW*0.05, bodyH*0.05-6+lift*0.15, bodyW*0.32, bodyH*0.25, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // 頭
+    const headW=W*0.40, headH=H*0.40, headX=bodyX+bodyW*0.50+headW*0.15, headY=-bodyH*0.20-4+lift*0.1;
+    ctx.save();
+    const gHead = ctx.createRadialGradient(headX - headW*0.15, headY - headH*0.15, headW*0.1, headX, headY, headW*0.8);
+    gHead.addColorStop(0, PALETTE.furLight); gHead.addColorStop(1, PALETTE.furMid);
+    ctx.fillStyle = gHead;
+    ctx.beginPath(); ctx.ellipse(headX, headY, headW*0.48, headH*0.50, 0, 0, Math.PI*2); ctx.fill();
+    // 耳朵
+    ctx.fillStyle = PALETTE.furDark; ctx.beginPath(); ctx.arc(headX - headW*0.18, headY - headH*0.50, headW*0.12, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(headX + headW*0.00,  headY - headH*0.55, headW*0.10, 0, Math.PI*2); ctx.fill();
+    // 鼻口 & 鼻
+    ctx.fillStyle = PALETTE.belly; ctx.beginPath(); ctx.ellipse(headX + headW*0.20, headY + headH*0.05, headW*0.23, headH*0.18, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = PALETTE.nose;  ctx.beginPath(); ctx.ellipse(headX + headW*0.32, headY + headH*0.02, headW*0.10, headH*0.08, 0, 0, Math.PI*2); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = PALETTE.eye; ctx.beginPath(); ctx.arc(headX + headW*0.10, headY - headH*0.08, Math.max(1.8, headW*0.04), 0, Math.PI*2); ctx.fill();
+    // 下顎陰影
+    ctx.globalAlpha=0.25; ctx.fillStyle='#000'; ctx.beginPath(); ctx.ellipse(headX + headW*0.18, headY + headH*0.15, headW*0.20, headH*0.10, 0, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha=1;
+    ctx.restore();
+
+    // 四肢
+    const legLen = H*0.55, legW=Math.max(6, W*0.08), footW=legW*1.4;
+    const hipY = bodyH*0.25 - 2 + lift*0.15;
+    const frontX = bodyX + bodyW*0.28, rearX = bodyX - bodyW*0.25;
+    drawLeg(frontX, hipY, step2, true);
+    drawLeg(frontX - legW*0.8, hipY+1, -step2*0.8, false, 0.7);
+    drawLeg(rearX, hipY+1, step, true);
+    drawLeg(rearX - legW*0.8, hipY+2, -step*0.8, false, 0.7);
+
+    // 尾巴
+    ctx.save(); ctx.fillStyle=PALETTE.furDark;
+    ctx.beginPath(); ctx.ellipse(bodyX - bodyW*0.50, -bodyH*0.15 + lift*0.1, W*0.06, H*0.05, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+    ctx.restore();
+
+    if (e._flash>0){
+      ctx.save(); ctx.globalCompositeOperation='screen'; ctx.globalAlpha=0.45; ctx.fillStyle='#fff'; ctx.fillRect(e.x, e.y, e.w, e.h); ctx.restore();
+    }
+
+    function drawLeg(rootX, rootY, phase, closeSide, dim=1){
+      const swing = phase*8, liftY=Math.max(0,phase)*5; const shade=closeSide?1:0.75*dim;
+      ctx.save(); ctx.translate(rootX + swing, rootY - liftY);
+      ctx.fillStyle = shade>0.9 ? PALETTE.furDark : PALETTE.furMid;
+      roundRect(ctx, -legW/2, 0, legW, legLen*0.55, legW*0.4); ctx.fill();
+      roundRect(ctx, -legW*0.9/2, legLen*0.55 - 2, legW*0.9, legLen*0.45, legW*0.35); ctx.fill();
+      ctx.fillStyle=PALETTE.claw; ctx.beginPath(); ctx.ellipse(0, legLen*0.45, footW*0.55, legW*0.40, 0, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    function roundRect(ctx, x, y, w, h, r){
+      const rr=Math.min(r,w/2,h/2);
+      ctx.beginPath();
+      ctx.moveTo(x+rr,y);
+      ctx.arcTo(x+w,y, x+w,y+h, rr);
+      ctx.arcTo(x+w,y+h, x,y+h, rr);
+      ctx.arcTo(x,y+h, x,y, rr);
+      ctx.arcTo(x,y, x+w,y, rr);
+      ctx.closePath();
+    }
+  }
+  // 提供 Drawer API，若未來要用 spritesheet 可自行改註冊
+  function makeBearSideDrawer(){ return function(ctx,e,now){ drawBearSidePlaceholder(ctx,e,now); }; }
+
+  /* ======================== 玩家工具 ======================== */
+  function getPlayerIfPlaying(){
+    try{ if(typeof window.__getMode==='function' && window.__getMode()==='play' && typeof window.__ensurePlayer==='function') return window.__ensurePlayer(); }catch{}
+    return null;
+  }
+
+  /* ======================== 熊（完整 AI） ======================== */
+  ENT.bear = {
+    label:'熊',
+    kind:'critter',          // 放在 Critters
+    ai:'bear',
+    stats:{ ...CFG.base },
+
+    spawn(opts={}){
+      loadWorldSnapshot(); // 初始化世界
+      return {
+        x:opts.x||0, y:opts.y||0,
+        vx:0, vy:0, face:1,
+        hp: opts.hp ?? CFG.base.hp,
+        maxHp: opts.maxHp ?? CFG.base.hp,
+        sizeTiles: opts.sizeTiles || { w:2, h:2 },
+        _state: 'wander',
+        _phase: Math.random()*Math.PI*2
+      };
+    },
+
+    render(ctx, e){
+      const now = performance.now()/1000;
+      const dt  = Math.min(0.033, Math.max(0.001, now - (e._last||now)));
+      e._last = now; e._dt = dt;
+
+      if(e._dead){
+        if(!e._dieAt) e._dieAt = now;
+        ctx.save(); const k = Math.max(0, 1 - (now - e._dieAt)/0.4);
+        ctx.globalAlpha = k; drawEntity(ctx,e,now); ctx.restore();
+        if(now - e._dieAt > 0.45){ e.x=e.y=-1e6; e.w=e.h=0; e.vx=e.vy=0; }
+        return;
+      }
+
+      ensureInit(e);
+      applySize(e);
+
+      const W = loadWorldSnapshot(); if(!W) return;
+      const T=W.T, p=getPlayerIfPlaying();
+      const ex=e.x+e.w/2, ey=e.y+e.h/2;
+
+      if(!p && e._state==='chase') e._state='wander';
+
+      // --- Wander ---
+      if(e._state==='wander'){
+        e._wanderT = (e._wanderT||0) - dt;
+        if(e._wanderT<=0){
+          e._wanderT = 1.0 + Math.random()*1.0;
+          const dir = (Math.random()<0.5?-1:1);
+          e.vx = dir * CFG.base.spd * (0.4+Math.random()*0.5);
+          if(e.onGround && Math.random()<0.35) e.vy = -(200 + Math.random()*80);
+          e.face = dir;
+        }
+        moveWithCollisions(e,dt);
+
+        if(p){
+          const px=p.x+p.w/2, py=p.y+p.h/2;
+          const canSee = hasLOS(ex,ey,px,py,W) && Math.hypot(px-ex,py-ey) < T*12;
+          if(canSee) e._state='chase';
+        }
+      }
+
+      // --- Chase ---
+      else if(e._state==='chase' && p){
+        const px=p.x+p.w/2, py=p.y+p.h/2;
+        const dx=px-ex, dy=py-ey; const dist=Math.hypot(px-ex,py-ey);
+
+        if(e._chargeT && e._chargeT>0){
+          e._chargeT -= dt;
+          const sign = Math.sign(dx) || (e.face||1);
+          e.vx = sign * CFG.base.chargeSpd;
+          if(e.onGround && Math.random()<0.12) e.vy = -120;
+          moveWithCollisions(e,dt);
+          e.face = sign;
+
+          if(dist < Math.max(CFG.base.swipeRangePx, T*0.8) && e._cool<=0){
+            hitPlayer(e, p, CFG.base.atkCharge, CFG.base.knockCharge);
+            e._cool = CFG.base.touchCD;
+          }
+        } else {
+          const spd = CFG.base.chaseSpd;
+          e.vx += Math.sign(dx) * spd * 0.05;
+          e.vx = Math.max(-spd, Math.min(spd, e.vx));
+          if(e.onGround && Math.abs(dy)>T*0.3) e.vy = -240;
+          moveWithCollisions(e,dt);
+          e.face = (dx>=0?1:-1);
+
+          e._chargeCD = Math.max(0, (e._chargeCD||0) - dt);
+          if(e._chargeCD<=0 && dist>=CFG.base.chargeMinPx && dist<=CFG.base.chargeMaxPx && hasLOS(ex,ey,px,py,W)){
+            e._chargeT = CFG.base.chargeDur;
+            e._chargeCD = 2.6;
+            try{
+              if(SKIN.spawnFx){
+                for(let i=0;i<10;i++){
+                  SKIN.spawnFx({ x:ex+(Math.random()*12-6), y:e.y+e.h,
+                    vx:(Math.random()*160-80), vy:-60-Math.random()*80,
+                    r:3+Math.random()*3, color:'rgba(180,120,80,0.9)', life:0.25, maxLife:0.25 });
+                }
+              }
+            }catch{}
+          }
+
+          if(e._cool>0) e._cool-=dt;
+          if(dist < CFG.base.swipeRangePx && e._cool<=0){
+            hitPlayer(e, p, CFG.base.atkSwipe, CFG.base.knockSwipe);
+            e._cool = CFG.base.touchCD * 0.9;
+          }
+        }
+
+        const canSee = hasLOS(ex,ey,px,py,W) && dist < T*14;
+        if(!canSee) e._state='wander';
+      }
+
+      // 綁定 Hitbox
+      if(!e._hb && window.DD_HITBOX){
+        e._hb = DD_HITBOX.track(e,{
+          team:'critter',
+          getBounds: ()=>({x:e.x,y:e.y,w:e.w,h:e.h}),
+          getHP: ()=>e.hp,
+          setHP: v=>{ e.hp=v },
+          iframes:0.12,
+          knock:{ force:360 },
+          getVel: ()=>({vx:e.vx||0, vy:e.vy||0}),
+          setVel: (vx,vy)=>{ e.vx=vx; e.vy=vy; },
+          onHit:   (en)=>{ en._flash=8; },
+          onDeath: (en)=>{
+            const cx=en.x+en.w/2, cy=en.y+en.h/2;
+            dropLootAt(cx,cy);
+            try{
+              if(SKIN.spawnFx){
+                SKIN.spawnFx({ x:cx, y:cy, r:22, vx:0, vy:-60, color:'rgba(180,120,80,0.95)', life:0.30, maxLife:0.30 });
+                SKIN.spawnFx({ x:cx, y:cy, r:14, vx:0, vy:0,  color:'rgba(70,45,30,0.85)',  life:0.22, maxLife:0.22 });
+              }
+            }catch{}
+            en._dead=true; en._dieAt=performance.now()/1000;
+          }
+        });
+      }
+
+      // 視覺
+      drawEntity(ctx,e,now);
+
+      /* === 內部工具 === */
+      function hitPlayer(en, p, atk, knock){
+        const ps = ENT.player && ENT.player.stats;
+        if(ps){
+          const mitig = Math.max(0, atk - (ps.def||0)*0.4);
+          ps.hp = Math.max(0, ps.hp - mitig);
+        }
+        const dir = Math.sign((p.x+p.w/2) - (en.x+en.w/2)) || (en.face||1);
+        p.vx = dir * (knock.vx||360);
+        p.vy = -(knock.vy||420);
+        try{
+          if(SKIN.spawnFx){
+            for(let i=0;i<8;i++){
+              SKIN.spawnFx({ x: en.x+en.w/2+(Math.random()*10-5), y: en.y+en.h/2+(Math.random()*6-3),
+                vx: (dir*120)+(Math.random()*100-50), vy: -50-Math.random()*100,
+                r: 2+Math.random()*3, color:'rgba(200,150,110,0.95)', life:0.30, maxLife:0.30 });
+            }
+          }
+        }catch{}
+      }
+      function drawEntity(ctx,e,now){
+        const drawer = SKIN && SKIN.ent && SKIN.ent.get && SKIN.ent.get('bear');
+        if(typeof drawer==='function'){ try{ drawer(ctx,e,now,window.THEME); return; }catch{} }
+        drawBearSidePlaceholder(ctx,e,now);
+      }
+    }
+  };
+
+  /* ======================== 初始化/尺寸 ======================== */
+  function ensureInit(e){
+    const W = loadWorldSnapshot(); if(!W) return;
+    if(!e._init){
+      e._init=true;
+      e.hp = (typeof e.hp==='number') ? e.hp : CFG.base.hp;
+      e.maxHp = e.maxHp || e.hp;
+      e._grav = CFG.gravity; e._bounce = CFG.bounce;
+      e.vx ||= 0; e.vy ||= 0; e.face ||= 1; e._cool ||= 0;
+      e._state ||= 'wander';
+      e._spawn = { x:e.x, y:e.y };
+    }
+  }
+  function applySize(e){
+    const W = loadWorldSnapshot(); const T=W?W.T:48; const scale=1;
+    e.w = Math.floor((e.sizeTiles?.w||2) * T * 0.90 * scale);
+    e.h = Math.floor((e.sizeTiles?.h||2) * T * 0.85 * scale);
+    e._touchR = Math.max(28, Math.min(160, T*0.7*scale));
+  }
+
+  /* ======================== Palette 註冊＆刷新（Critters） ======================== */
+  // 使用側身細長繪法作為預設外觀（之後若用 spritesheet，可改 SKIN.useEnt('bear', makeBearDrawer(...)) 覆蓋）
+  if(SKIN && SKIN.useEnt && (!SKIN.ent?.get || !SKIN.ent.get('bear'))){
+    SKIN.useEnt('bear', makeBearSideDrawer());
+  }
+  (function refreshCritters(){
+    const sels = ['critters','Critters'].map(cat=>`#palette .pill[data-cat="${cat}"]`).join(',');
+    const btn = document.querySelector(sels);
+    if(btn && btn.classList.contains('active')) btn.click();
+  })();
+
+})();
+</script>
+<!-- ============ /Plugin: 熊（Bear｜Critters｜側身細長版） ============ -->
+
+
 
 //動物插件結束
 
@@ -4905,7 +5871,6 @@ if (handBtn && handBtn.parentElement === right) {
 
 
 //地形插件開始
-
 <script>
 /* =========================
    水外掛（~）
@@ -5010,8 +5975,8 @@ TILES.add({
     e._lastWaterGy = gy;
 
     // 基礎游泳手感：阻尼 + 浮力
-    e.vx *= 0.92;        // 水中水平阻尼
-    e.vy *= 0.82;        // 垂直阻尼
+    e.vx *= 0.82;        // 水中水平阻尼
+    e.vy *= 0.72;        // 垂直阻尼
     e.vy -= 320 * dt;    // 基礎浮力（不按鍵也會慢慢上浮）
 
     // 長按「跳躍」→ 顯著上浮；封頂避免穿牆
@@ -5026,8 +5991,6 @@ TILES.add({
   }
 });
 </script>
-
-
 
 
 
