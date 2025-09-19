@@ -1,0 +1,5039 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>平台闖關（資料驅動骨架 · Phase 1）</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e1126;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Noto Sans,Arial}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+
+  /* 上方工具列 */
+  #uiTop{position:fixed;left:8px;right:8px;top:8px;display:flex;gap:8px;align-items:center;z-index:10}
+  .btn{appearance:none;border:0;background:#21d07a;color:#042;font-weight:800;border-radius:10px;padding:8px 12px;cursor:pointer}
+  .btn.grey{background:#cfe3ff;color:#0a2352}
+
+  /* 調色盤（底部面板） */
+  .panel{position:fixed;left:8px;right:8px;bottom:8px;background:#0008;border:1px solid #ffffff22;border-radius:12px;padding:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;z-index:2}
+  .tile{min-width:42px;min-height:42px;display:flex;align-items:center;justify-content:center;border-radius:8px;background:#ffffff14;border:1px solid #ffffff22;user-select:none}
+  .tile.active{outline:2px solid #ffd34e}
+  .group-title{font-size:12px;opacity:.85;padding:4px 6px;border-radius:6px;background:#ffffff14;border:1px solid #ffffff22;user-select:none}
+  .pill{appearance:none;border:0;background:#cfe3ff;color:#0a2352;font-weight:800;border-radius:999px;padding:6px 12px;cursor:pointer}
+  .pill.active{background:#ffd34e;color:#3b2900}
+  .pal-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pal-row.header{width:100%}
+  .pal-row.tiles{padding-top:4px;flex-wrap:wrap}
+  .pal-row.footer{margin-left:auto}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+<canvas id="cv" aria-label="主畫布"></canvas>
+
+<!-- 簡易工具列（Phase 1 只含地編相關） -->
+<div id="uiTop">
+  <button id="mapBtn" class="btn">地圖</button>
+  <button id="helpBtn" class="btn grey">說明</button>
+</div>
+
+<!-- 調色盤：分類 + 動態項目 + 視圖工具 -->
+<div class="panel" id="palette" aria-label="調色盤">
+  <div class="pal-row header">
+    <span class="group-title">調色盤</span>
+    <button class="pill" data-cat="building">建築</button>
+    <button class="pill" data-cat="monsters">怪獸</button>
+    <button class="pill" data-cat="critters">動物</button>
+    <button id="palBackBtn" class="pill hidden">← 返回分類</button>
+    <span style="margin-left:auto"></span>
+  </div>
+  <div id="palTiles" class="pal-row tiles"></div>
+  <div class="pal-row footer">
+    <span class="group-title">視圖 / 工具</span>
+    <span style="margin-left:auto"></span>
+    <button id="smallerBtn" class="btn grey">縮小格</button>
+    <button id="biggerBtn" class="btn grey">放大格</button>
+    <button id="dragBtn"   class="btn grey" data-brush="DRAG">拖移</button>
+    <button id="eraseBtn"  class="btn grey" data-brush=".">刪除</button>
+  </div>
+</div>
+
+<script>
+/* =========================
+   Phase 1：核心骨架（地圖/調色盤/畫格/拖移/縮放）
+   - Canvas + UI
+   - 資料註冊表：ENT（生物）、SPAWNERS（刷怪點→怪物）、TILE_TYPES（建築）
+   - 調色盤自動生成（依註冊表）
+   - 地圖資料結構、落筆（放置/刪除）、視圖拖移、縮放
+   - 生物/刷怪點：通用 spawn/render「框架」（目前不帶任何怪/動物，之後 Phase 2+ 會填）
+   ========================= */
+
+(()=>{
+
+/* ---------- 畫布與相機 ---------- */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha:false });
+const DPR = Math.max(1, Math.min(3, window.devicePixelRatio||1));
+let vw=0,vh=0;
+function resize(){ vw=innerWidth; vh=innerHeight; cv.width=Math.floor(vw*DPR); cv.height=Math.floor(vh*DPR); cv.style.width=vw+'px'; cv.style.height=vh+'px'; ctx.setTransform(DPR,0,0,DPR,0,0); }
+resize(); addEventListener('resize', resize);
+
+let TILE = 48;
+let VIEW_SCALE = 1, VIEW_MIN=0.5, VIEW_MAX=2.0, VIEW_STEP=0.1;
+let camX=0, camY=0;
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+function toWorld(cx,cy){ return { x: camX + cx/VIEW_SCALE, y: camY + cy/VIEW_SCALE }; }
+
+/* ---------- 資料註冊表（空殼，待 Phase 2+ 填入物種/AI） ---------- */
+const ENT = {
+  // 之後會登記：'dragon': {label:'噴火龍', kind:'monster', ai:'dragon', stats:{...}, render:(ctx,e)=>{...}}
+};
+const SPAWNERS = {
+  // 之後會登記刷怪點種類映射，例如：'GD':'dragon'
+};
+const TILE_TYPES = {
+  building: [
+    {label:'# 地面', val:'#', solid:true},
+    {label:'^ 尖刺', val:'^'},
+    {label:'o 金幣', val:'o'},
+    {label:'S 出生', val:'S'},
+  ],
+  monsters: [
+    // 之後由 ENT 自動鏡射進來
+  ],
+  critters: [
+    // 之後由 ENT 自動鏡射進來
+  ]
+};
+
+// 將 ENT 依 kind 映射到分類（目前 ENT 為空，UI 仍會顯示分類但無項目）
+function computePaletteGroups(){
+  const mons=[], crits=[];
+  for(const [key,def] of Object.entries(ENT)){
+    const item = {label:(def.label||key), val:key};
+    if(def.kind==='monster') mons.push(item);
+    else if(def.kind==='critter') crits.push(item);
+  }
+  return {
+    building: TILE_TYPES.building.slice(),
+    monsters: mons,
+    critters: crits
+  };
+}
+
+/* ---------- 地圖資料結構 ---------- */
+let mapW=40, mapH=24;
+const DOT='.'; // 空白
+let tiles = makeEmpty(mapW,mapH);
+let startPos = {x:2, y: mapH-14};
+seedBasic();
+
+function makeEmpty(w,h){ const a=[]; for(let y=0;y<h;y++) a.push(Array(w).fill(DOT)); return a; }
+function seedBasic(){
+  // 地板
+  for(let x=0;x<mapW;x++) tiles[mapH-1][x]='#';
+  // 起點/終點/幾枚金幣
+  startPos = { x:2, y: mapH-6 };
+  tiles[startPos.y][startPos.x] = 'S';
+  tiles[mapH-2][Math.min(mapW-1, 20)] = 'X';
+  tiles[mapH-3][8]='o'; tiles[mapH-6][12]='o';
+}
+
+/* ---------- 生物/刷怪點：通用資料與渲染（目前只有占位） ---------- */
+const entities = [];   // 普通生物：{type, x,y,w,h, spawnX,spawnY, ...}
+const spawners = [];   // 刷怪點：{gtype, x,y, ...}
+
+function spawnEntity(type, gx, gy, opts={}){
+  const w = TILE - 12, h = TILE - 12;
+  const e = {
+    type,
+    spawnX: gx, spawnY: gy,
+    x: gx*TILE + (TILE - w)/2,
+    y: gy*TILE + (TILE - h),
+    w, h,
+    ...opts
+  };
+  entities.push(e);
+  return e;
+}
+
+function spawnSpawner(gtype, gx, gy, opts={}){
+  const s = { gtype, x:gx, y:gy, ...opts };
+  spawners.push(s); return s;
+}
+function renderEntities(){
+  for(const e of entities){
+    const def = ENT[e.type];
+    if(def && typeof def.render==='function'){ def.render(ctx,e); }
+    else{ drawPlaceholder(e.x,e.y,e.w,e.h, e.type); }
+  }
+  for(const s of spawners){
+    drawSpawnerPlaceholder(s.x*TILE, s.y*TILE, TILE, TILE, s.gtype||'G?');
+  }
+}
+
+/* ---------- 調色盤：分類/動態 tiles ---------- */
+const palette = {
+  root: document.getElementById('palette'),
+  tiles: document.getElementById('palTiles'),
+  backBtn: document.getElementById('palBackBtn')
+};
+let currentCategory = null;
+let brush = '#';
+
+function renderCategory(cat){
+  currentCategory = cat;
+  palette.tiles.innerHTML = '';
+  document.querySelectorAll('#palette .pill[data-cat]').forEach(b=>b.classList.remove('active'));
+  const catBtn = document.querySelector(`#palette .pill[data-cat="${cat}"]`);
+  if (catBtn) catBtn.classList.add('active');
+
+  palette.backBtn.classList.remove('hidden');
+
+  const groups = computePaletteGroups();
+  const items = groups[cat] || [];
+  if(items.length===0){
+    const div=document.createElement('div');
+    div.className='tile';
+    div.textContent='（此分類尚無項目）';
+    div.style.opacity=.7;
+    palette.tiles.appendChild(div);
+  }else{
+    for(const item of items){
+      const div=document.createElement('div');
+      div.className='tile';
+      div.setAttribute('data-brush', item.val);
+      div.textContent=item.label;
+      palette.tiles.appendChild(div);
+    }
+  }
+  refreshActiveBrushUI();
+}
+function backToCategories(){
+  currentCategory = null;
+  palette.tiles.innerHTML = '';
+  document.querySelectorAll('#palette .pill[data-cat]').forEach(b=>b.classList.remove('active'));
+  palette.backBtn.classList.add('hidden');
+}
+function refreshActiveBrushUI(){
+  palette.tiles.querySelectorAll('.tile').forEach(el=>{
+    el.classList.toggle('active', el.getAttribute('data-brush')===brush);
+  });
+}
+
+palette.root.addEventListener('click', (e)=>{
+  const catBtn = e.target.closest('.pill[data-cat]');
+  if(catBtn){ renderCategory(catBtn.getAttribute('data-cat')); return; }
+  if(e.target.id==='palBackBtn'){ backToCategories(); return; }
+  const tile = e.target.closest('.tile');
+  if(tile){ brush = tile.getAttribute('data-brush'); refreshActiveBrushUI(); }
+});
+
+document.getElementById('dragBtn').onclick = ()=>{ brush='DRAG'; refreshActiveBrushUI(); };
+document.getElementById('eraseBtn').onclick= ()=>{ brush='.';    refreshActiveBrushUI(); };
+document.getElementById('smallerBtn').onclick=()=>{ VIEW_SCALE = Math.max(VIEW_MIN, +(VIEW_SCALE - VIEW_STEP).toFixed(2)); };
+document.getElementById('biggerBtn').onclick=()=>{ VIEW_SCALE = Math.min(VIEW_MAX, +(VIEW_SCALE + VIEW_STEP).toFixed(2)); };
+
+// 預設顯示分類總覽
+backToCategories();
+
+/* ---------- 編輯：落筆/刪除 + 視圖拖移 ---------- */
+cv.addEventListener('contextmenu', e=>e.preventDefault());
+let draggingView=false, dragStart={x:0,y:0}, camStart={x:0,y:0};
+let isErasing=false;
+
+cv.addEventListener('pointerdown', e=>{
+  if(brush==='DRAG'){
+    draggingView=true;
+    dragStart={x:e.clientX, y:e.clientY};
+    camStart={x:camX, y:camY};
+    return;
+  }
+  isErasing = (e.button===2 || e.ctrlKey || brush==='.');
+  paintAtEvent(e);
+});
+cv.addEventListener('pointermove', e=>{
+  if(draggingView && brush==='DRAG'){
+    const dx=e.clientX-dragStart.x, dy=e.clientY-dragStart.y;
+    camX = clamp(camStart.x - dx/VIEW_SCALE, 0, mapW*TILE - vw/VIEW_SCALE);
+    camY = clamp(camStart.y - dy/VIEW_SCALE, 0, mapH*TILE - vh/VIEW_SCALE);
+    return;
+  }
+  if(e.buttons && brush!=='DRAG') paintAtEvent(e);
+});
+cv.addEventListener('pointerup', ()=>{
+  draggingView=false;
+});
+
+function paintAtEvent(e){
+  const {x,y}=toWorld(e.clientX,e.clientY);
+  const gx=Math.floor(x/TILE), gy=Math.floor(y/TILE);
+  if(gx<0||gy<0||gx>=mapW||gy>=mapH) return;
+
+  if(isErasing){
+    // 刪除地塊/起點
+    if(tiles[gy][gx]==='S'){ tiles[gy][gx]=DOT; }
+    else tiles[gy][gx]=DOT;
+
+    // 刪除同位置的生物/刷怪點（若未來有）
+    for(let i=entities.length-1;i>=0;i--) if(entities[i].spawnX===gx&&entities[i].spawnY===gy) entities.splice(i,1);
+    for(let i=spawners.length-1;i>=0;i--) if(spawners[i].x===gx&&spawners[i].y===gy) spawners.splice(i,1);
+  }else{
+    // 放置：若 brush 是已登記的生物 -> 生成；否則視為地塊
+    if(ENT[brush]){
+      // 單格只允許一個生物
+      for(let i=entities.length-1;i>=0;i--) if(entities[i].spawnX===gx&&entities[i].spawnY===gy) entities.splice(i,1);
+      spawnEntity(brush,gx,gy);
+    }else if(SPAWNERS[brush]){
+      for(let i=spawners.length-1;i>=0;i--) if(spawners[i].x===gx&&spawners[i].y===gy) spawners.splice(i,1);
+      spawnSpawner(brush,gx,gy);
+    }else{
+      // S 起點唯一
+      if(brush==='S'){
+        for(let y=0;y<mapH;y++) for(let x=0;x<mapW;x++){ if(tiles[y][x]==='S') tiles[y][x]=DOT; }
+  startPos = { x: gx, y: gy };
+      }
+      tiles[gy][gx]=brush;
+      if (brush==='S') snapPlayerToStart();
+window.dispatchEvent(new CustomEvent('startpos-change', {
+  detail: { x: startPos.x, y: startPos.y }
+}));
+    }
+  }
+  autoSave();
+}
+
+// ★ 新增整段：把玩家移到 startPos（S）上，並把鏡頭置中（Phase 1 內）
+function snapPlayerToStart(){
+  try{
+    if (window.__ensurePlayer){
+      const p = window.__ensurePlayer(); // 沒有就會順便生成玩家
+      const T = TILE;
+      p.x = startPos.x*T + (T - p.w)/2;
+      p.y = startPos.y*T + (T - p.h);
+      p.vx = 0; p.vy = 0;
+      p.onGround = false; p.coyote = 0; p.jumpBuf = 0;
+    }
+    if (window.__centerOn){ window.__centerOn(startPos.x, startPos.y); }
+  }catch{}
+}
+
+
+/* ---------- 存檔（Phase 1：單一 autosave） ---------- */
+const SAVE_KEY='dd_skel_phase1';
+function exportJSON(){
+  return JSON.stringify({
+    w:mapW, h:mapH,
+    tileRows: tiles.map(r=>r.join('')),
+    start: startPos,
+    tileSize: TILE,
+    // ✅ 保存更多怪物狀態
+    entities: entities.map(e=>({
+      type: e.type,
+      spawnX: e.spawnX, spawnY: e.spawnY,
+      x: e.x, y: e.y, w: e.w, h: e.h,
+      vx: e.vx||0, vy: e.vy||0, face: e.face||1,
+      stats: e.stats ? { ...e.stats } : undefined,
+      extra: e.extra || undefined
+    })),
+    // ✅ 保存刷怪點參數
+    spawners: spawners.map(s=>({
+      gtype: s.gtype, x: s.x, y: s.y,
+      freq: s.freq||8, chance: s.chance||0.5, maxAlive: s.maxAlive||3
+    }))
+  });
+}
+
+function importJSON(txt){
+  const d=JSON.parse(txt);
+  mapW=d.w; mapH=d.h;
+  tiles = d.tileRows.map(r=>r.split(''));
+  startPos = d.start || startPos;
+  TILE = d.tileSize || TILE;
+
+  // 重新生成 entities
+  entities.length=0;
+  (d.entities||[]).forEach(e=>{
+    const inst = spawnEntity(e.type, e.spawnX, e.spawnY);
+    if(!inst) return;
+    if(typeof e.x==='number') inst.x = e.x;
+    if(typeof e.y==='number') inst.y = e.y;
+    if(typeof e.w==='number') inst.w = e.w;
+    if(typeof e.h==='number') inst.h = e.h;
+    inst.vx = e.vx||0; inst.vy = e.vy||0;
+    inst.face = e.face||1;
+    if(e.stats) inst.stats = { ...e.stats };
+    if(e.extra) inst.extra = e.extra;
+  });
+
+  // 重新生成 spawners
+  spawners.length=0;
+  (d.spawners||[]).forEach(s=>{
+    const ss = spawnSpawner(s.gtype, s.x, s.y);
+    if(!ss) return;
+    ss.freq = s.freq||8;
+    ss.chance = s.chance||0.5;
+    ss.maxAlive = s.maxAlive||3;
+  });
+}
+
+function autoSave(){ try{ localStorage.setItem(SAVE_KEY, exportJSON()); }catch{} }
+(function(){ const s=localStorage.getItem(SAVE_KEY); if(s){ try{ importJSON(s); }catch{} } })();
+
+
+// ===== 金幣撿取：Phase1 端 =====
+window.addEventListener('pickup-tile', (e)=>{
+  const { gx, gy, type } = e.detail || {};
+  if (gx==null || gy==null) return;
+  if (gx<0 || gy<0 || gx>=mapW || gy>=mapH) return;
+
+  if (type === 'coin' && tiles[gy][gx] === 'o') {
+    tiles[gy][gx] = '.';   // 清空該格
+    autoSave();            // 存檔讓影子地圖更新
+  }
+});
+// ===== 金幣撿取：Phase1 end =====
+
+/* ---------- UI：新地圖/說明（提供對外 API） ---------- */
+function __newMap(){
+  if(!confirm('建立新地圖？目前內容會被覆蓋（已自動儲存可再載回）。')) return;
+  mapW=40; mapH=24; TILE=48; tiles=makeEmpty(mapW,mapH); seedBasic();
+  entities.length=0; spawners.length=0;
+  camX=0; camY=0; VIEW_SCALE=1;
+  if (typeof snapPlayerToStart === 'function') snapPlayerToStart();
+  autoSave();
+  alert('✅ 已建立新地圖！');
+  requestAnimationFrame(render);
+}
+window.__newMap = __newMap; // 導出給 Phase 3 的「地圖」選單使用
+
+document.getElementById('helpBtn').onclick=()=>alert(
+`Phase 1（骨架）：
+- 下方「調色盤」選分類→點 tile 放置；按「刪除」或按住 Ctrl/右鍵可擦除。
+- 視圖：用「拖移」拉動、放大/縮小調整格子大小（編輯視圖縮放）。
+- 此階段沒有玩家/AI/戰鬥。之後 Phase 2~4 會逐步加入。
+`
+);
+
+/* ---------- 繪圖 ---------- */
+function render(){
+  // 背景
+  const g = ctx.createLinearGradient(0,0,0,vh);
+  g.addColorStop(0,'#0e1126');
+  g.addColorStop(1,'#1a1f3d');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,vw,vh);
+
+  ctx.save();
+  ctx.translate(-camX*VIEW_SCALE, -camY*VIEW_SCALE);
+  ctx.scale(VIEW_SCALE, VIEW_SCALE);
+
+  // 可視範圍
+  const xMin = Math.max(0, Math.floor(camX/TILE)-1);
+  const yMin = Math.max(0, Math.floor(camY/TILE)-1);
+  const xMax = Math.min(mapW-1, Math.floor((camX+vw/VIEW_SCALE)/TILE)+1);
+  const yMax = Math.min(mapH-1, Math.floor((camY+vh/VIEW_SCALE)/TILE)+1);
+
+  // ★ 目前是否「遊玩模式」
+  const isPlay = (typeof window.__getMode === 'function' && window.__getMode() === 'play');
+
+  // 地塊
+  for(let y=yMin; y<=yMax; y++){
+    for(let x=xMin; x<=xMax; x++){
+      const ch = tiles[y][x], px = x*TILE, py = y*TILE;
+      if (ch === '#') {
+        ctx.fillStyle = '#3e466e';
+        ctx.fillRect(px, py, TILE, TILE);
+        // ★ 只在「編輯模式」畫外框；遊玩模式不畫，避免看起來像網格
+        if (!isPlay) {
+          ctx.strokeStyle = '#5a6494';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(px+0.5, py+0.5, TILE-1, TILE-1);
+        }
+      } else if (ch === 'o') {
+        drawCoin(px, py);
+      } else if (ch === '^') {
+        drawSpikes(px, py, TILE, TILE);
+      } else if (ch === 'X') {
+        drawFlag(px, py);
+      } else if (ch === 'S') {
+        drawStart(px, py);
+      } else if (ch === 'D') {
+        drawDoor(px, py);
+      } else {
+        // ★ 新增：把未知字元交給外掛畫（例如水「~」）
+        if (typeof window.__drawUnknownTile === 'function') {
+          window.__drawUnknownTile(ctx, ch, px, py, TILE);
+        }
+      }
+    }
+  }
+
+  // 生物 / 刷怪點（目前顯示占位）
+  renderEntities();
+
+
+  // ★ 新增：戰鬥特效（刀光/箭矢等）
+  if (typeof window.__drawCombat === 'function') {
+    window.__drawCombat(ctx);
+  }
+
+
+
+
+  // ★ 網格線：只在「編輯模式」顯示（遊玩模式隱藏）
+  if (!isPlay) {
+    ctx.strokeStyle = 'rgba(255,255,255,.08)'; // 想測試可見度可臨時改成 .18
+    for (let x = xMin; x <= xMax + 1; x++) {
+      ctx.beginPath();
+      ctx.moveTo(x * TILE, yMin * TILE);
+      ctx.lineTo(x * TILE, (yMax + 1) * TILE);
+      ctx.stroke();
+    }
+    for (let y = yMin; y <= yMax + 1; y++) {
+      ctx.beginPath();
+      ctx.moveTo(xMin * TILE, y * TILE);
+      ctx.lineTo((xMax + 1) * TILE, y * TILE);
+      ctx.stroke();
+    }
+  }
+
+  // ★ 一定要還原座標與狀態
+  ctx.restore();
+}
+/* ---------- 基礎圖塊繪製 ---------- */
+function drawCoin(x,y){
+  ctx.beginPath(); ctx.arc(x+TILE/2, y+TILE/2, 10, 0, Math.PI*2);
+  ctx.fillStyle='#ffd34e'; ctx.fill();
+  ctx.strokeStyle='#e5b93c'; ctx.stroke();
+}
+function drawSpikes(x,y,w,h){
+  ctx.fillStyle='#ff4d6d';
+  const n=4; for(let i=0;i<n;i++){ const bx=x+i*(w/n);
+    ctx.beginPath(); ctx.moveTo(bx,y+h); ctx.lineTo(bx+(w/n)/2,y+8); ctx.lineTo(bx+(w/n),y+h); ctx.closePath(); ctx.fill();
+  }
+}
+function drawFlag(x,y){
+  ctx.fillStyle='#5a6494'; ctx.fillRect(x+22,y+8,4,TILE-8);
+  ctx.beginPath(); ctx.moveTo(x+26,y+12); ctx.lineTo(x+48,y+20); ctx.lineTo(x+26,y+28); ctx.closePath();
+  ctx.fillStyle='#ffd34e'; ctx.fill();
+}
+function drawStart(x,y){
+  ctx.fillStyle='#21d07a'; ctx.fillRect(x+8,y+8,TILE-16,TILE-16);
+  ctx.fillStyle='#042'; ctx.fillRect(x+12,y+12,TILE-24,10);
+}
+function drawDoor(x,y){
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='#2e3a7a'; ctx.fillRect(8,4,TILE-16,TILE-8);
+  ctx.fillStyle='#8ab4f8'; ctx.fillRect(12,8,TILE-24,TILE-20);
+  ctx.strokeStyle='#b4c8ff'; ctx.strokeRect(11.5,7.5,TILE-23,TILE-19);
+  ctx.restore();
+}
+function drawPlaceholder(x,y,w,h,txt='?'){
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle='#ffffff55'; ctx.strokeRect(0.5,0.5,w-1,h-1);
+  ctx.fillStyle='#fff'; ctx.font='12px ui-sans-serif'; ctx.fillText(txt, 6, 16);
+  ctx.restore();
+}
+function drawSpawnerPlaceholder(x,y,w,h,txt='G?'){
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='#8a6cff'; ctx.fillRect(10,10,w-20,h-20);
+  ctx.fillStyle='#111'; ctx.fillRect(16,16,w-32,h-32);
+  ctx.fillStyle='#fff'; ctx.font='12px ui-sans-serif'; ctx.fillText(txt, 14, 24);
+  ctx.restore();
+}
+
+/* ---------- 主循環（Phase 1 只有渲染） ---------- */
+function loop(){ render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+/* ---------- 導出一些全域（方便 Phase 2+ 疊代存取） ---------- */
+Object.assign(window, {
+  ENT, SPAWNERS, TILE_TYPES,
+  spawnEntity, spawnSpawner,
+  // ★ 既有：置中鏡頭到「格座標」（gx, gy）
+
+  // ★ 新增：根據 type 移除所有實體（離開遊玩時用）
+  __despawnByType(type){
+    for (let i = entities.length - 1; i >= 0; i--) {
+      if (entities[i].type === type) entities.splice(i, 1);
+    }
+  },
+
+  __centerOn(gx, gy){
+    const cx = gx*TILE + TILE/2;
+    const cy = gy*TILE + TILE/2;
+    camX = clamp(cx - vw/(2*VIEW_SCALE), 0, mapW*TILE - vw/VIEW_SCALE);
+    camY = clamp(cy - vh/(2*VIEW_SCALE), 0, mapH*TILE - vh/VIEW_SCALE);
+  },
+
+  // ★ 新增：以「世界座標（像素）」瞬間置中鏡頭
+  __centerOnWorld(wx, wy){
+    camX = clamp(wx - vw/(2*VIEW_SCALE), 0, mapW*TILE - vw/VIEW_SCALE);
+    camY = clamp(wy - vh/(2*VIEW_SCALE), 0, mapH*TILE - vh/VIEW_SCALE);
+  },
+
+  // ★ 新增（平滑版）：以「世界座標（像素）」平滑置中
+  //    alpha 越大越跟緊，建議 0.12 ~ 0.22
+  __centerOnWorldSmooth(wx, wy, alpha = 0.16){
+    const tx = clamp(wx - vw/(2*VIEW_SCALE), 0, mapW*TILE - vw/VIEW_SCALE);
+    const ty = clamp(wy - vh/(2*VIEW_SCALE), 0, mapH*TILE - vh/VIEW_SCALE);
+    camX += (tx - camX) * alpha;
+    camY += (ty - camY) * alpha;
+  }
+});
+})(); 
+
+</script>
+<script>
+/* =========================
+   Phase 2：玩家與物理 + AI 派發器 + 刷怪骨架
+   - 玩家（鍵盤）：左右移動、跳躍、重力、瓦片碰撞
+   - ENT 註冊：player（資料驅動）、AI 策略表骨架
+   - 刷怪系統骨架：由 localStorage spawners 讀入（目前無怪則不會生）
+   - 不修改 Phase1 內部變數：改讀 autosave 建立「影子地圖」做碰撞
+   ========================= */
+(() => {
+  "use strict";
+
+  /* ---------- 與 Phase1 溝通的橋接 ---------- */
+
+
+
+// ===== 通用：把玩家送回起點（重生） =====
+function __respawnToStart(e, showToast = true){
+  loadWorldSnapshot(true);
+  const sPos = world.start, T = world.tileSize;
+  e.x = sPos.x*T + (T - e.w)/2;
+  e.y = sPos.y*T + (T - e.h);
+  e.vx = e.vy = 0;
+  e.onGround = false; e.coyote = 0; e.jumpBuf = 0;
+
+  // 回滿血（可改：回半血等）
+  const stats = (ENT.player && ENT.player.stats) || (e.stats ||= {maxHp:100,hp:100});
+  stats.hp = stats.maxHp;
+
+  if (showToast){
+    const box = document.getElementById('toastBox');
+    if (box){
+      box.textContent = '💀 倒地，回到起點';
+      box.style.background = '#000b';
+      box.style.padding = '8px 12px'; box.style.borderRadius = '8px';
+      clearTimeout(window.__die_toast);
+      window.__die_toast = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+  }
+}
+
+// ===== 通用：對玩家造成傷害（含無敵時間、擊退、死亡→重生） =====
+function __hurtPlayer(e, opts = {}){
+  const { dmg=1, iFrames=0.8, kx=0, ky=-520, fx=true, color='rgba(255,100,120,0.95)' } = opts;
+
+  // 無敵時間倒數
+  e._hurtTimer = Math.max(0, (e._hurtTimer || 0) - (opts.dt || 0));
+
+  if (e._hurtTimer > 0) return false; // 還在無敵，不吃傷害
+
+  const s = (ENT.player && ENT.player.stats) || (e.stats ||= {maxHp:100,hp:100});
+  s.hp = Math.max(0, (s.hp|0) - Math.max(0, dmg|0));
+
+  e._hurtTimer = iFrames;
+  e._flash = 10;
+
+  // 擊退
+  if (kx) e.vx = kx;
+  if (typeof ky === 'number') e.vy = ky;
+
+  // 受擊 FX（可選）
+  if (fx && window.SKIN && SKIN.spawnFx){
+    for (let i=0;i<6;i++){
+      SKIN.spawnFx({
+        x: e.x + e.w/2 + (Math.random()*12-6),
+        y: e.y + e.h/2 + (Math.random()*8-4),
+        vx: (Math.random()*160-80),
+        vy: (-60 - Math.random()*120),
+        r: 4, color, life: 0.5, maxLife: 0.5
+      });
+    }
+  }
+
+  // 死亡 → 回起點
+  if (s.hp <= 0){
+    __respawnToStart(e, true);
+    return true;
+  }
+  return false;
+}
+
+// 導出給其他模組/怪物 AI 直接呼叫（可選）
+window.__respawnPlayer = ()=>{ const p = (window.__ensurePlayer && window.__ensurePlayer()); if(p) __respawnToStart(p,true); };
+window.__hurtPlayer = (opts={})=>{ const p = (window.__ensurePlayer && window.__ensurePlayer()); if(p) return __hurtPlayer(p, opts); return false; };
+//死亡邏輯結束
+
+
+  const SAVE_KEY = 'dd_skel_phase1';              // Phase1 的 autosave key
+  const ENT = window.ENT || {};                   // Phase1 暴露
+  const SPAWNERS = window.SPAWNERS || {};         // Phase1 暴露
+  const spawnEntity = window.spawnEntity;         // Phase1 暴露
+
+  /* ---------- 影子地圖（從 autosave 取出，用於碰撞/起點） ---------- */
+  let world = null, _rawCache = null;
+  function loadWorldSnapshot(force=false){
+    const raw = localStorage.getItem(SAVE_KEY) || '';
+    if (!force && raw === _rawCache) return world;
+    _rawCache = raw;
+    try{
+      const d = JSON.parse(raw || '{}');
+      world = {
+        w: d.w || 40,
+        h: d.h || 24,
+        tileSize: d.tileSize || 48,
+        tiles: (d.tileRows||[]).map(r=>r.split('')),
+        spawners: d.spawners || [],
+        start: d.start || {x:2, y:Math.max(0,(d.h||24)-6)}
+      };
+    }catch{
+      world = { w:40, h:24, tileSize:48, tiles:[], spawners:[], start:{x:2,y:18} };
+    }
+    return world;
+  }
+  loadWorldSnapshot(true);
+
+/* ---------- 地圖查詢 ---------- */
+function tileAtGX(gx,gy){
+  if(!world) return '.';
+  if (gx<0 || gy<0 || gx>=world.w || gy>=world.h) return '#'; // 牆外當實心
+  const row = world.tiles[gy];
+  if(!row) return '.';
+  return row[gx] || '.';
+}
+
+function isSolidAtRect(rx,ry,rw,rh){
+  const T = world.tileSize;
+  const x0 = Math.floor(rx/T), x1 = Math.floor((rx+rw-1)/T);
+  const y0 = Math.floor(ry/T), y1 = Math.floor((ry+rh-1)/T);
+  for(let y=y0;y<=y1;y++){
+    for(let x=x0;x<=x1;x++){
+      const ch = tileAtGX(x,y);
+      // ★ 新版判斷：支援外掛 Tile API
+      if (typeof window.__tileIsSolid === 'function') {
+        if (window.__tileIsSolid(ch)) return true;
+      } else if (ch === '#') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+  /* ---------- 玩家定義（資料驅動 ENT） ---------- */
+  ENT.player = {
+    label: '玩家',
+    kind:  'player',
+    ai:    '__player',         // 交給 AI 策略表中的 __player 處理
+    stats: { maxHp:100, hp:100, atk:10, def:2, spd:360, jump:820 },
+    render(ctx, e){
+      const t = performance.now()/1000;
+      const W = Math.max(e.w, world.tileSize*0.6);
+      const H = Math.max(e.h, world.tileSize*0.95);
+      // 走路微幅起伏
+      const bob = (e.onGround ? Math.sin(t*8)*1.8 : Math.sin(t*4)*0.6);
+      const cx = e.x + e.w/2, cy = e.y + e.h;
+
+      ctx.save();
+      ctx.translate(cx, cy + bob);
+      ctx.scale(e.face>0?1:-1, 1);
+
+      // 簡易身形
+      ctx.fillStyle = '#4a86e8';                      // 藍外衣
+      ctx.fillRect(-W*0.25, -H*0.85, W*0.5, H*0.6);
+      ctx.fillStyle = '#f2f5f9';                      // 白褲
+      ctx.fillRect(-W*0.20, -H*0.25, W*0.4, H*0.25);
+      ctx.fillStyle = '#ffd34e';                      // 小王冠點綴
+      ctx.beginPath();
+      ctx.moveTo(-W*0.18, -H*0.85);
+      ctx.lineTo(0, -H*0.95);
+      ctx.lineTo(W*0.18, -H*0.85);
+      ctx.closePath(); ctx.fill();
+
+      ctx.restore();
+
+      // HP 條（簡易，正式 HUD 留到 Phase3）
+      const s = ENT.player.stats;
+      const pct = Math.max(0, Math.min(1, s.hp/s.maxHp));
+      const bw = 40, bh = 5;
+      const bx = e.x + (e.w - bw)/2, by = e.y - 8;
+      ctx.fillStyle='rgba(0,0,0,.5)'; ctx.fillRect(bx,by,bw,bh);
+      ctx.fillStyle = pct>0.5? '#37e3a1' : pct>0.25? '#ffd34e' : '#ff6b6b';
+      ctx.fillRect(bx,by,bw*pct,bh);
+    }
+  };
+
+  /* ---------- 生成玩家（從 S 起點） ---------- */
+  let PLAYER = null;
+  function ensurePlayer(){
+    loadWorldSnapshot(); // 取最新
+    if (PLAYER && typeof PLAYER.x === 'number') return PLAYER;
+    const s = world.start || {x:2,y:world.h-6};
+    // spawnEntity 需格座標，產生後回傳的物件就是內部 entities 中的同一參考
+    PLAYER = spawnEntity('player', s.x, s.y, {
+      vx:0, vy:0, w:28, h:40,
+      onGround:false, coyote:0, jumpBuf:0, face:1,
+  stats: ENT.player.stats
+});
+
+    return PLAYER;
+  }
+
+  /* ---------- 控制與模式 ---------- */
+  let mode='edit', running=false;
+  const keys = { left:false, right:false, jump:false };
+
+  // 建立模式按鈕（插入到 #uiTop 右側）
+  const uiTop = document.getElementById('uiTop');
+  const modeBtn = document.createElement('button');
+  modeBtn.id='modeBtn'; modeBtn.className='btn';
+  modeBtn.textContent='切到：遊玩模式';
+  uiTop.appendChild(modeBtn);
+
+  // 建立透明遮罩，Play 時擋住畫布編輯操作
+  const playShield = document.createElement('div');
+  Object.assign(playShield.style, {
+    position:'fixed', left:0, top:0, right:0, bottom:0,
+    zIndex:1, pointerEvents:'none', background:'transparent'
+  });
+  document.body.appendChild(playShield);
+
+playShield.id = 'playShield';
+
+// 對外公布一個穩定的模式狀態（給 Phase 3 用）
+window.__modeState = { value:'edit' };
+function setMode(next){
+  if(next==='play'){
+    window.__modeState.value = 'play';
+    mode = 'play'; running = true;
+    modeBtn.textContent = '切到：編輯模式';
+    playShield.style.pointerEvents = 'auto';
+
+    // ★ 只在進入 Play 才生成玩家
+    const p = ensurePlayer();
+
+    // 進入 Play 時置中到玩家
+    if (p && window.__centerOn) {
+      const T = world.tileSize;
+      const gx = Math.floor((p.x + p.w/2) / T);
+      const gy = Math.floor((p.y + p.h/2) / T);
+      window.__centerOn(gx, gy);
+    }
+
+  } else {
+    window.__modeState.value = 'edit';
+    mode = 'edit'; running = false;
+    modeBtn.textContent = '切到：遊玩模式';
+    playShield.style.pointerEvents = 'none';
+
+    // ★ 回到編輯模式：把玩家實體移除，避免在編輯時被畫格影響
+    if (window.__despawnByType) window.__despawnByType('player');
+    PLAYER = null; // 斷開參考，確保下次 Play 會重新生成
+  }
+
+  // 通知其他階段（Phase 3）目前模式
+  window.dispatchEvent(new CustomEvent('modechange',{ detail:{ mode } }));
+}
+window.__setMode = setMode;
+window.__getMode = () => window.__modeState.value;
+
+modeBtn.onclick = ()=> setMode(mode==='edit' ? 'play' : 'edit');
+
+// ★ 新增：當 Phase 1 說「起點改了」→ 立刻把玩家搬到新起點並置中鏡頭
+window.addEventListener('startpos-change', (e)=>{
+  // ★ 只有在遊玩模式才處理玩家
+  if (window.__getMode && window.__getMode() !== 'play') return;
+
+  const p = ensurePlayer();           // 確保玩家存在（只有 play 會真的生成）
+  loadWorldSnapshot(true);            // 取最新版 start/tileSize
+  const T = world.tileSize;
+  const s = e.detail || world.start;
+
+  // 放到 S 的上面
+  p.x = s.x*T + (T - p.w)/2;
+  p.y = s.y*T + (T - p.h);
+  p.vx = 0; p.vy = 0;
+  p.onGround = false; p.coyote = 0; p.jumpBuf = 0;
+
+  // 置中鏡頭
+  if (window.__centerOn) window.__centerOn(s.x, s.y);
+});
+
+// 讓舊函式也走新邏輯（保留相容性）
+function enterPlay(){ setMode('play'); }
+function enterEdit(){ setMode('edit'); }
+
+
+  // 鍵盤
+addEventListener('keydown', (e)=>{
+  if (mode !== 'play') return;
+
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') keys.left  = true;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = true;
+
+  // ★ 只在非重複 keydown 時灌一次 jumpBuf，避免長按造成空中再跳
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    if (!e.repeat && PLAYER) PLAYER.jumpBuf = 0.14;
+    keys.jump = true;
+  }
+});
+
+addEventListener('keyup', (e)=>{
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') keys.left  = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = false;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') keys.jump = false;
+});
+
+  /* ---------- 物理工具 ---------- */
+  const GRAVITY = 2400;
+  function moveWithCollisions(o, dt){
+    if(!world) return;
+
+    const T = world.tileSize;
+
+    // 水平
+    let nx = o.x + o.vx*dt;
+    if(!isSolidAtRect(nx, o.y, o.w, o.h)){
+      o.x = nx;
+    }else{
+      const dir = Math.sign(o.vx)||1;
+      let px = o.x;
+      while(!isSolidAtRect(px+dir, o.y, o.w, o.h)) px += dir;
+      o.x = px; o.vx = 0;
+    }
+    // 垂直
+    let ny = o.y + o.vy*dt;
+    o.onGround = false;
+    if(!isSolidAtRect(o.x, ny, o.w, o.h)){
+      o.y = ny;
+    }else{
+      const dir = Math.sign(o.vy)||1;
+      let py = o.y;
+      while(!isSolidAtRect(o.x, py+dir, o.w, o.h)) py += dir;
+      o.y = py;
+      if(dir>0) o.onGround = true;
+      o.vy = 0;
+    }
+    // 世界邊界（防呆）
+    const maxX = world.w*T - o.w, maxY = world.h*T - o.h;
+    o.x = Math.max(0, Math.min(maxX, o.x));
+    o.y = Math.max(0, Math.min(maxY, o.y));
+  }
+
+  /* ---------- AI 策略表（骨架） ---------- */
+  const AI = {
+    // 玩家：鍵盤控制 + 基礎跳躍緩衝/土狼時間
+    '__player'(e, dt){
+      const s = ENT.player.stats;
+      const MOVE = s.spd, JUMP = s.jump;
+
+
+
+// --- 全域死亡檢查：HP <= 0 就回到出生點 ---
+if ((s.hp|0) <= 0) {
+  try{ loadWorldSnapshot(true); }catch{}
+  const T = world.tileSize, S = world.start;
+  e.x = S.x*T + (T - e.w)/2;
+  e.y = S.y*T + (T - e.h);
+  e.vx = e.vy = 0;
+  e.onGround = false; e.coyote = 0; e.jumpBuf = 0;
+  s.hp = s.maxHp;  // 重生回滿
+  // 可選提示
+  const box = document.getElementById('toastBox');
+  if (box){
+    box.textContent = '💀 倒地，回到起點';
+    box.style.background = '#000b';
+    box.style.padding = '8px 12px'; box.style.borderRadius = '8px';
+    clearTimeout(window.__die_toast);
+    window.__die_toast = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+  }
+  return; // 本幀到此結束
+}
+
+
+      // 更新世界快照（編輯時會變動）
+      _accumSnap += dt;
+      if(_accumSnap>=0.5){ loadWorldSnapshot(); _accumSnap = 0; }
+
+      let ax = 0;
+      if(keys.left)  ax -= 1;
+      if(keys.right) ax += 1;
+      e.vx = ax * MOVE;
+      if(ax) e.face = ax>0 ? 1 : -1;
+
+      // 垂直運動
+      e.vy += GRAVITY * dt;
+      if(e.vy > 2000) e.vy = 2000;
+
+      // 重新偵測是否踩在地面（避免站定時 onGround 被清掉）
+      e.onGround = isSolidAtRect(e.x, e.y + 1, e.w, e.h);
+
+      // 跳躍（單跳；停用土狼）
+      e.jumpBuf = Math.max(0, e.jumpBuf - dt);
+      if (e.onGround && e.jumpBuf > 0) {
+        e.vy = -JUMP;
+        e.onGround = false;
+        e.jumpBuf = 0;
+      }
+
+      // 鬆開跳躍鍵，削頂
+      // 鬆開跳躍鍵，削頂（但在水中不削）
+      if (!keys.jump && !e._inWater && e.vy < -180) e.vy = -180;
+
+
+      // 完全不使用 coyote
+      e.coyote = 0;
+
+      moveWithCollisions(e, dt);
+
+      // 碰撞後再檢查一次地面狀態
+      e.onGround = isSolidAtRect(e.x, e.y + 1, e.w, e.h);
+
+
+
+// ===== 尖刺傷害 + 金幣撿取（整段替換這裡） =====
+const gx = Math.floor((e.x + e.w/2)/world.tileSize);
+const gy = Math.floor((e.y + e.h/2)/world.tileSize);
+
+// 無敵倒數（避免連續吃傷害）
+e._hurtTimer = Math.max(0, (e._hurtTimer||0) - dt);
+
+// ---------- 1) 尖刺：扣血 / 無敵 / 彈開 / 死亡重生 ----------
+if (tileAtGX(gx, gy) === '^' && e._hurtTimer === 0) {
+  const s = ENT.player.stats;          // 玩家數值（HUD 用這份）
+  const DMG = 25;                       // 尖刺傷害（自行調整）
+  s.hp = Math.max(0, s.hp - DMG);       // 扣血
+  e._hurtTimer = 0.8;                   // 無敵時間（秒）
+  e._flash = 10;                        // （可選）給 render 閃爍用
+
+  // 彈開：依面向做水平擊退
+  const knockDir = (e.face >= 0 ? -1 : 1);
+  e.vy = -520;
+  e.vx = 240 * knockDir;
+
+  // 受擊特效（可選）
+  try{
+    if (window.SKIN && SKIN.spawnFx) {
+      for (let i=0;i<6;i++){
+        SKIN.spawnFx({
+          x: e.x + e.w/2 + (Math.random()*12-6),
+          y: e.y + e.h/2 + (Math.random()*8 -4),
+          vx: (Math.random()*160-80),
+          vy: (-60 - Math.random()*120),
+          r: 4, color: 'rgba(255,100,120,0.95)', life: 0.5, maxLife: 0.5
+        });
+      }
+    }
+  }catch{}
+
+  // 死亡處理：回起點並回滿血
+  if (s.hp <= 0) {
+    const sPos = world.start, T = world.tileSize;
+    e.x = sPos.x*T + (T - e.w)/2;
+    e.y = sPos.y*T + (T - e.h);
+    e.vx = e.vy = 0;
+    e.onGround = false; e.coyote = 0; e.jumpBuf = 0;
+    s.hp = s.maxHp;                        // 重生回滿
+
+    // 提示
+    const box = document.getElementById('toastBox');
+    if (box){
+      box.textContent = '💀 倒地，回到起點';
+      box.style.background = '#000b';
+      box.style.padding = '8px 12px'; box.style.borderRadius = '8px';
+      clearTimeout(window.__die_toast);
+      window.__die_toast = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+  }
+}
+
+// ---------- 2) 金幣：撿起 +1，清掉地圖該格 ----------
+if (tileAtGX(gx, gy) === 'o') {
+  // 背包 +1
+  const INV = window.INVENTORY || (window.INVENTORY = { meat:0, loot:0, coins:0 });
+  INV.coins = (INV.coins|0) + 1;
+  if (typeof window.refreshBag === 'function') window.refreshBag();
+
+  // 通知 Phase1 把該格清空 & autosave（若沒掛監聽也不會拋錯）
+  try{
+    window.dispatchEvent(new CustomEvent('pickup-tile', { detail:{ gx, gy, type:'coin' }}));
+  }catch{}
+
+  // 立刻刷新影子地圖快照，避免下一幀又判到 'o'
+  try{ if (typeof loadWorldSnapshot === 'function') loadWorldSnapshot(true); }catch{}
+
+  // 提示
+  const box = document.getElementById('toastBox');
+  if (box){
+    box.textContent = '🪙 +1';
+    box.style.background = '#000b';
+    box.style.padding = '8px 12px'; box.style.borderRadius='8px';
+    clearTimeout(window.__coin_toast);
+    window.__coin_toast = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 600);
+  }
+}
+// ===== 尖刺傷害 + 金幣撿取（整段替換到這裡結束） =====
+// ===== 金幣撿取：Phase2 偵測 =====
+if (tileAtGX(gx, gy) === 'o') {
+  // 1) 加入背包
+  const INV = window.INVENTORY || (window.INVENTORY = { meat:0, loot:0, coins:0 });
+  INV.coins = (INV.coins|0) + 1;
+  if (typeof window.refreshBag === 'function') window.refreshBag();
+
+  // 2) 通知 Phase1 清空該格
+  window.dispatchEvent(new CustomEvent('pickup-tile', { detail:{ gx, gy, type:'coin' }}));
+
+  // 3) 立即刷新影子地圖，避免下一幀還判到 'o'
+  if (typeof loadWorldSnapshot === 'function') loadWorldSnapshot(true);
+
+  // 4) 提示文字
+  const box = document.getElementById('toastBox');
+  if (box){
+    box.textContent = '🪙 +1';
+    box.style.background = '#000b';
+    box.style.padding = '8px 12px';
+    box.style.borderRadius = '8px';
+    clearTimeout(window.__coin_toast);
+    window.__coin_toast = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 600);
+  }
+}
+// ===== 金幣撿取：Phase2 end =====
+
+
+
+    },
+
+
+
+
+    // 日後用：一般怪（不用現在）
+    'idle'(e, dt){ /* 站著不動骨架 */ },
+    'walker'(e, dt){ /* 左右巡邏骨架 */ },
+    'dragon'(e, dt){ /* 噴火骨架（Phase4 實作） */ }
+  };
+
+  /* ---------- 刷怪點骨架（讀 autosave spawners） ---------- */
+  let _spawnerStates = []; // {x,y,gtype, timer}
+  function rebuildSpawners(){
+    loadWorldSnapshot();
+    _spawnerStates = (world.spawners||[]).map(s=>({
+      x:s.x, y:s.y, gtype:s.gtype, timer:0,
+      freq: s.freq || 8, chance: s.chance || 0.5, maxAlive: s.maxAlive || 3
+    }));
+  }
+  rebuildSpawners();
+
+  function updateSpawners(dt){
+    // 目前沒有任何怪物 ENT 註冊，所以這段只是骨架，不會產生東西
+    for(const st of _spawnerStates){
+      st.timer += dt;
+      if(st.timer < st.freq) continue;
+      st.timer = 0;
+      if(Math.random() >= st.chance) continue;
+      const spawnKind = SPAWNERS[st.gtype]; // 例如 'GD' -> 'dragon'
+      if(!spawnKind) continue;
+      if(!ENT[spawnKind]) continue;         // 尚未註冊該怪物
+      spawnEntity(spawnKind, st.x, st.y, { spawnerKey:`${st.x},${st.y}` });
+    }
+  }
+
+  /* ---------- 更新主迴圈（只做邏輯；Phase1 的 render 仍由其 rAF 處理） ---------- */
+  let _lastTs = 0, _accumSnap = 0;
+  function tick(ts){
+    const dt = Math.min(0.033, _lastTs ? (ts - _lastTs)/1000 : 0);
+    _lastTs = ts;
+
+    if(running){
+      const p = ensurePlayer();
+      // 派發玩家 AI（其他生物等後續階段取得 entity 陣列後再一起處理）
+      AI['__player'](p, dt);
+      // 刷怪骨架
+      updateSpawners(dt);
+  // ★ 新增：遊玩模式下鏡頭跟著玩家（以世界座標置中；優先使用平滑）
+  if (p){
+    const cx = p.x + p.w/2;
+    const cy = p.y + p.h/2;
+    if (window.__centerOnWorldSmooth) {
+      window.__centerOnWorldSmooth(cx, cy, 0.16); // 想更緊跟可調 0.20
+    } else if (window.__centerOnWorld) {
+      window.__centerOnWorld(cx, cy);
+    } else if (window.__centerOn) {
+      // 最終備援：用格座標近似（稍微跳格，但能用）
+      const T = world.tileSize;
+      window.__centerOn((cx/T) - 0.5, (cy/T) - 0.5);
+    }
+  }
+    }
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  /* ---------- 導出（之後 Phase3/4 會用到） ---------- */
+  Object.assign(window, {
+    __ensurePlayer: ensurePlayer,
+    __rebuildSpawners: rebuildSpawners,
+    __AI: AI
+  });
+
+})(); // Phase 2 IIFE
+</script>
+
+<script>
+/* =========================
+   Phase 3：系統功能骨架
+   功能：
+   - HP/屬性 HUD（讀 ENT.player.stats）
+   - 背包面板（INVENTORY：meat/loot/coins）
+   - Checkpoint（存/載）、自動存檔橋接
+   - 世界清單（localStorage 命名存/載/刪）
+   - 手機虛擬按鍵（發送鍵盤事件給 Phase2）
+   注意：
+   - 只做骨架，沒有餵食/掉落/馴服邏輯（之後 Phase4 填）
+   ========================= */
+(() => {
+  'use strict';
+
+  /* ---------- 與 Phase1/2 橋接 ---------- */
+  const SAVE_KEY = 'dd_skel_phase1';     // Phase1/2 使用的 autosave key
+  const CHECKPOINT_KEY = 'dd_checkpoint_phase3';
+  const ENT = window.ENT || {};
+  const ensurePlayer = window.__ensurePlayer || (() => null);
+
+  /* ---------- 小工具：建立或取得元素 ---------- */
+  function ensureEl(id, html, parent=document.body){
+    let el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = id;
+      el.innerHTML = html || '';
+      parent.appendChild(el);
+    }
+    return el;
+  }
+  function css(el, obj){ Object.assign(el.style, obj); return el; }
+
+  /* ---------- INVENTORY 骨架 ---------- */
+  const INVENTORY = window.INVENTORY || { meat:0, loot:0, coins:0 };
+  window.INVENTORY = INVENTORY;  // 導出供之後邏輯使用
+
+/* ---------- 置頂工具列：加入新按鈕（地圖選單 + 背包） ---------- */
+const uiTop = document.getElementById('uiTop') || ensureEl('uiTop','', document.body);
+const mkBtn = (id, text, cls='btn')=>{
+  let b=document.getElementById(id);
+  if(!b){ b=document.createElement('button'); b.id=id; b.className=cls; b.textContent=text; uiTop.appendChild(b); }
+  return b;
+};
+const bagBtn = mkBtn('bagBtn','背包','btn');
+const mapBtn = mkBtn('mapBtn','地圖','btn');
+const playerBtn = mkBtn('playerBtn','玩家','btn');
+
+// 小選單（新地圖 / 存為起點 / 世界管理）
+let mapMenu = document.getElementById('mapMenu');
+if(!mapMenu){
+  mapMenu = document.createElement('div');
+  mapMenu.id = 'mapMenu';
+  mapMenu.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <button id="mNew"  class="btn">新地圖</button>
+      <button id="mCP"   class="btn grey">存為起點</button>
+      <button id="mWorld" class="btn grey">世界管理</button>
+    </div>`;
+  Object.assign(mapMenu.style,{
+    position:'fixed', top:'48px', left:'8px', zIndex:7,
+    background:'#0b1024', border:'1px solid #ffffff33',
+    borderRadius:'12px', padding:'8px', display:'none'
+  });
+  document.body.appendChild(mapMenu);
+
+  // 綁定事件
+  mapMenu.querySelector('#mNew').onclick  = ()=>{ window.__newMap && window.__newMap(); hideMenu(); };
+  mapMenu.querySelector('#mCP').onclick   = ()=>{ saveCheckpoint(); hideMenu(); };
+  mapMenu.querySelector('#mWorld').onclick= ()=>{ renderWorldList(); portal.style.display='block'; hideMenu(); };
+
+  function hideMenu(){ mapMenu.style.display='none'; }
+  function toggleMenu(){
+    mapMenu.style.display = (mapMenu.style.display==='none' ? 'block' : 'none');
+  }
+  mapBtn.onclick = toggleMenu;
+  window.addEventListener('click', (e)=>{
+    if(e.target===mapBtn || mapMenu.contains(e.target)) return;
+    hideMenu();
+  });
+}
+  /* ---------- HUD（HP 與屬性） ---------- */
+  const hpHud = ensureEl('hpHud', `
+    <div style="background:#0008;border:1px solid #ffffff22;border-radius:8px;padding:6px 10px;font-weight:800">
+      <div>HP：<b id="hpNum">—/—</b></div>
+      <div class="bar" style="width:160px;height:10px;background:#222;border-radius:6px;overflow:hidden;margin-top:6px">
+        <div id="hpFill" style="height:100%;background:linear-gradient(90deg,#ff5f6d,#ffc371);width:100%"></div>
+      </div>
+      <div class="small" id="statLine" style="font-size:12px;opacity:.85">ATK —｜DEF —｜SPD —｜JUMP —</div>
+    </div>
+  `);
+  css(hpHud, {position:'fixed', left:'10px', top:'56px', zIndex:4, display:'none'});
+
+  function showHud(v){ hpHud.style.display = v ? 'block' : 'none'; }
+  function updateHud(){
+    const p = ensurePlayer();
+    if(!p || !ENT.player) return;
+    const s = ENT.player.stats;
+    const hpEl = document.getElementById('hpNum');
+    const fill = document.getElementById('hpFill');
+    const stL  = document.getElementById('statLine');
+    if(!hpEl || !fill || !stL) return;
+
+    hpEl.textContent = `${Math.max(0, Math.ceil(s.hp))}/${s.maxHp}`;
+    fill.style.width = `${100 * Math.max(0, s.hp)/s.maxHp}%`;
+    stL.textContent  = `ATK ${s.atk}｜DEF ${s.def}｜SPD ${s.spd}｜JUMP ${s.jump}`;
+  }
+
+  /* ---------- 背包面板 ---------- */
+  const bag = ensureEl('bag', `
+    <div style="font-weight:800;margin-bottom:6px">🎒 背包</div>
+    <div class="bag-list">
+      <div class="bag-row" style="display:flex;justify-content:space-between;align-items:center;margin:6px 0;padding:6px 8px;border-radius:8px;background:#ffffff10">
+        <span>🍖 腐肉</span><b id="bagMeat">0</b>
+      </div>
+      <div class="bag-row" style="display:flex;justify-content:space-between;align-items:center;margin:6px 0;padding:6px 8px;border-radius:8px;background:#ffffff10">
+        <span>🎁 掉落物</span><b id="bagLoot">0</b>
+      </div>
+      <div class="bag-row" style="display:flex;justify-content:space-between;align-items:center;margin:6px 0;padding:6px 8px;border-radius:8px;background:#ffffff10">
+        <span>🪙 金幣</span><b id="bagCoins">0</b>
+      </div>
+      <div class="bag-row" style="display:flex;justify-content:space-between;align-items:center;margin:6px 0;padding:6px 8px;border-radius:8px;background:#ffffff10">
+        <span>🧬 裝備（預留）</span><span class="small" style="font-size:12px;opacity:.85">待 Phase4</span>
+      </div>
+    </div>
+  `);
+  css(bag, {position:'fixed', right:'8px', top:'56px', background:'#0b1024cc',
+            border:'1px solid #ffffff33', borderRadius:'12px', padding:'12px',
+            zIndex:5, display:'none', minWidth:'240px', maxWidth:'40vw'});
+
+  function refreshBag(){
+    const q=(id,v)=>{ const el=document.getElementById(id); if(el) el.textContent=String(v); };
+    q('bagMeat',  INVENTORY.meat|0);
+    q('bagLoot',  INVENTORY.loot|0);
+    q('bagCoins', INVENTORY.coins|0);
+  }
+  bagBtn.onclick = ()=>{ bag.style.display = (bag.style.display==='none'?'block':'none'); refreshBag(); };
+
+
+// ---------- 掉落物：點擊／長按開箱 → 抽裝備（修正版） ----------
+(function bindLootOpen(){
+  const lootLabel = document.getElementById('bagLoot');
+  if(!lootLabel) return;
+  const lootRow = lootLabel.closest('.bag-row');
+
+  const P = { gear:0.35, coin:0.45, meat:0.20 };
+
+  function rollOne(){
+    if((INVENTORY.loot|0) <= 0){ toast('沒有掉落物了'); return false; }
+    INVENTORY.loot--;
+    const r = Math.random();
+    if(r < P.gear){
+      const g = (window.GEAR_REG || [{ id:'sword_short', name:'短劍', slot:'weapon', atk:3, rarity:'C' }])[Math.floor(Math.random()*(window.GEAR_REG?.length||1))];
+      const inst = { id:g.id, name:g.name, slot:g.slot, atk:g.atk||0, def:g.def||0, rarity:g.rarity||'C' };
+      (window.GEAR?.slots ? (g.slot==='weapon' ? window.GEAR.weapons : window.GEAR.stash) : []).push(inst);
+      if(window.saveGear) window.saveGear();
+      toast(`🎉 獲得裝備：${inst.name}`);
+    }else if(r < P.gear + P.coin){
+      INVENTORY.coins++; toast('🪙 +1');
+    }else{
+      INVENTORY.meat++;  toast('🍖 +1');
+    }
+    refreshBag();
+    return true;
+  }
+
+  let holdTimer=null, loopTimer=null;
+  let long=false, pressing=false;
+
+  function clearTimers(){
+    if(holdTimer){ clearTimeout(holdTimer); holdTimer=null; }
+    if(loopTimer){ clearInterval(loopTimer); loopTimer=null; }
+    long=false; pressing=false;
+  }
+
+  function start(){
+    pressing=true; long=false;
+    holdTimer = setTimeout(()=>{
+      if(!pressing) return;
+      long=true;
+      loopTimer = setInterval(()=>{ if(!rollOne()) clearTimers(); }, 140);
+    }, 350);
+  }
+
+  function end(){
+    if(!pressing) return;          // ← 只有在 loot 列啟動過才理會
+    if(!long) rollOne();
+    clearTimers();
+  }
+
+  // 只對「掉落物」那一列啟動
+  lootRow.addEventListener('mousedown',  start);
+  lootRow.addEventListener('touchstart', start, {passive:true}); // 不阻斷外部點擊
+
+  // 全域聽結束，但不 preventDefault、不處理非本次按壓
+  window.addEventListener('mouseup',     end);
+  window.addEventListener('touchend',    end);
+  window.addEventListener('touchcancel', clearTimers);
+})();
+
+
+  /* ---------- Checkpoint（骨架） ---------- */
+  function saveCheckpoint(){
+    const raw = localStorage.getItem(SAVE_KEY)||'';
+    try{
+      const d = JSON.parse(raw||'{}');
+      localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(d));
+      toast('✅ 已存為起點（Checkpoint）');
+    }catch{
+      toast('⚠️ 起點存檔失敗');
+    }
+  }
+  function loadCheckpoint(){
+    const s = localStorage.getItem(CHECKPOINT_KEY)||'';
+    if(!s){ toast('尚未設定起點'); return false; }
+    try{
+      // 覆寫當前 autosave 並強制刷新（骨架做法，簡單直覺）
+      localStorage.setItem(SAVE_KEY, s);
+      toast('✅ 已載入起點，重新整理以套用'); 
+      // 若你的 Phase1 有對外 import API，可在此直接呼叫取代 reload
+      setTimeout(()=>location.reload(), 350);
+      return true;
+    }catch{
+      toast('⚠️ 起點載入失敗');
+      return false;
+    }
+  }
+
+  /* ---------- 世界管理（本地命名存/載/刪） ---------- */
+  const portal = ensureEl('portal', `
+    <div style="position:relative">
+      <button id="portalClose" class="btn grey" style="position:absolute;top:6px;right:6px">關閉</button>
+      <h3 style="margin:0 0 8px 0">🚪 世界管理</h3>
+      <div class="small" style="opacity:.9;margin-bottom:10px">以本機 localStorage 儲存/載入。</div>
+
+      <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
+        <input id="worldName" type="text" placeholder="世界名稱"
+               style="flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#020617;color:#cbd5e1">
+        <button id="saveWorldBtn" class="btn">儲存目前世界</button>
+      </div>
+
+      <div class="small" style="opacity:.9;margin-top:10px">已存世界：</div>
+      <div id="portalList" style="margin-top:6px"></div>
+    </div>
+  `);
+  css(portal, {position:'fixed', left:'50%', top:'50%', transform:'translate(-50%,-50%)',
+               background:'#0b1024', border:'1px solid #ffffff33', borderRadius:'12px',
+               padding:'12px', zIndex:8, display:'none', minWidth:'320px'});
+  portal.querySelector('#portalClose').onclick = ()=> portal.style.display='none';
+  portal.querySelector('#saveWorldBtn').onclick = ()=>{
+    const name = (portal.querySelector('#worldName').value||'').trim();
+    saveWorldAs(name);
+  };
+
+  function nextWorldKey(){
+    let idx=1; while(localStorage.getItem('world_'+idx)) idx++;
+    return 'world_'+idx;
+  }
+  function saveWorldAs(name){
+    const raw = localStorage.getItem(SAVE_KEY)||'';
+    let obj=null; try{ obj=JSON.parse(raw||'{}'); }catch{}
+    if(!obj){ toast('⚠️ 沒有可儲存的世界'); return; }
+
+    const now = new Date().toISOString();
+    obj.meta = obj.meta||{};
+    if(name) obj.meta.name = name;
+    obj.meta.editedAt = now;
+
+    // 覆蓋同名（若存在）
+    const { keyByName } = scanWorlds();
+    const overwriteKey = name && keyByName[name];
+
+    const key = overwriteKey || nextWorldKey();
+    localStorage.setItem(key, JSON.stringify(obj));
+    renderWorldList();
+    toast(overwriteKey? `✅ 已覆蓋「${name}」` : `✅ 已儲存為 ${key}${name?`（${name}）`:''}`);
+  }
+  function scanWorlds(){
+    const keys = Object.keys(localStorage).filter(k=>k.startsWith('world_'));
+    const list = [];
+    const keyByName = {};
+    for(const k of keys){
+      try{
+        const v = JSON.parse(localStorage.getItem(k)||'{}');
+        const name = v?.meta?.name || '';
+        const editedAt = v?.meta?.editedAt || '';
+        if(name && !keyByName[name]) keyByName[name]=k;
+        list.push({key:k, name, editedAt});
+      }catch{}
+    }
+    // 新到舊
+    list.sort((a,b)=> (Date.parse(b.editedAt||0)-Date.parse(a.editedAt||0)) || a.key.localeCompare(b.key));
+    return { list, keyByName };
+  }
+  function renderWorldList(){
+    const box = portal.querySelector('#portalList');
+    box.innerHTML = '';
+    const { list } = scanWorlds();
+    if(list.length===0){
+      box.innerHTML = `<div class="small" style="opacity:.8">尚無世界，輸入名稱後按「儲存目前世界」。</div>`;
+      return;
+    }
+    for(const it of list){
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;background:#ffffff10;border:1px solid #ffffff22;border-radius:8px;padding:6px 8px;margin:6px 0';
+      const label = it.name ? `${it.name}（${it.key}）` : it.key;
+      const timeStr = it.editedAt ? new Date(it.editedAt).toLocaleString() : '';
+      row.innerHTML = `
+        <div><div style="font-weight:700">${label}</div>
+             <div class="small" style="opacity:.8">${timeStr}</div></div>
+        <div style="display:flex;gap:6px">
+          <button class="btn" data-act="load" data-k="${it.key}">載入</button>
+          <button class="btn grey" data-act="rename" data-k="${it.key}">重新命名</button>
+          <button class="btn grey" data-act="delete" data-k="${it.key}">刪除</button>
+        </div>`;
+      box.appendChild(row);
+    }
+    // 綁定
+    box.querySelectorAll('button').forEach(btn=>{
+      const act = btn.getAttribute('data-act');
+      const k   = btn.getAttribute('data-k');
+      btn.onclick = ()=>{
+        if(act==='load'){
+          const txt = localStorage.getItem(k)||'';
+          if(!txt){ toast('讀取失敗'); return; }
+          localStorage.setItem(SAVE_KEY, txt);
+          toast('✅ 已載入，重新整理以套用');
+          setTimeout(()=>location.reload(), 350);
+        }else if(act==='rename'){
+          let obj=null; try{ obj=JSON.parse(localStorage.getItem(k)||'{}'); }catch{}
+          const curr = obj?.meta?.name || '';
+          const nn = prompt('輸入新名稱（可留空）', curr);
+          if(nn===null) return;
+          obj.meta = obj.meta||{};
+          obj.meta.name = (nn||'').trim();
+          obj.meta.editedAt = new Date().toISOString();
+          localStorage.setItem(k, JSON.stringify(obj));
+          renderWorldList();
+        }else if(act==='delete'){
+          if(confirm('確定刪除？此動作無法復原。')){
+            localStorage.removeItem(k);
+            renderWorldList();
+          }
+        }
+      };
+    });
+  }
+
+  /* ---------- 手機虛擬按鍵（把觸控轉成鍵盤事件） ---------- */
+  const controls = ensureEl('controls', `
+    <div class="cluster left" style="position:absolute;left:12px;bottom:12px;display:flex;gap:12px;align-items:center">
+      <div class="key wide" data-key="left">←</div>
+      <div class="key wide" data-key="right">→</div>
+    </div>
+    <div class="cluster right" style="position:absolute;right:12px;bottom:12px;display:flex;gap:10px;align-items:flex-end;flex-direction:column">
+      <div style="display:flex;gap:10px;">
+        <div class="key" data-key="jump"  style="width:56px;height:56px;border-radius:999px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.12);backdrop-filter:blur(4px);font-weight:900">⤒</div>
+      </div>
+    </div>
+  `);
+  css(controls, {position:'fixed', left:0, right:0, bottom:0, pointerEvents:'none', zIndex:6, display:'none'});
+
+// ★ 讓每顆 .key 可以吃到指標事件（容器仍是 pointer-events:none）
+controls.querySelectorAll('.key').forEach(el => el.style.pointerEvents = 'auto');
+
+// 玩家操作鈕外觀
+controls.querySelectorAll('.key').forEach(el=>{
+  el.style.userSelect = 'none';
+  el.style.padding = '10px 14px';
+  el.style.borderRadius = '10px';
+  el.style.background = 'rgba(255,255,255,.12)';
+  el.style.fontWeight = '900';
+  el.style.display = 'flex';
+  el.style.alignItems = 'center';
+  el.style.justifyContent = 'center';
+});
+controls.querySelectorAll('.key.wide').forEach(el=>{
+  el.style.width = '64px';
+  el.style.height = '40px';
+});
+
+ // 只有進入遊玩時顯示（跟 Phase2 模式同步）
+const modeBtn   = document.getElementById('modeBtn');
+const paletteEl = document.getElementById('palette'); // ★ 取得調色盤
+if (modeBtn){
+  // 監聽 Phase 2 廣播的 modechange
+  window.addEventListener('modechange', (e)=>{
+    const on = e.detail.mode === 'play';
+    controls.style.display = on ? 'block' : 'none';
+    showHud(on);
+    if (paletteEl) paletteEl.style.display = on ? 'none' : 'flex'; // ★ 遊玩隱藏，編輯顯示
+  });
+
+  // 初始化一次（剛載入就已是 play 的情況）
+  const on = (window.__getMode && window.__getMode()==='play');
+  controls.style.display = on ? 'block' : 'none';
+  showHud(on);
+  if (paletteEl) paletteEl.style.display = on ? 'none' : 'flex'; // ★ 初始狀態同步
+}
+
+  function sendKey(code, type){
+    const ev = new KeyboardEvent(type, {code, key:code, bubbles:true});
+    window.dispatchEvent(ev);
+  }
+  function bindTouchKey(el, downCode, upCode=downCode){
+    const down = (e)=>{ sendKey(downCode,'keydown'); e.preventDefault(); };
+    const up   = (e)=>{ sendKey(upCode,'keyup'); e.preventDefault(); };
+    el.addEventListener('touchstart', down, {passive:false});
+    el.addEventListener('touchend',   up,   {passive:false});
+    el.addEventListener('touchcancel',up,   {passive:false});
+    el.addEventListener('mousedown',  down);
+    window.addEventListener('mouseup', up);
+  }
+  // 綁定 Left/Right/Jump → Phase2 已監聽 ArrowLeft/ArrowRight/Space
+  controls.querySelectorAll('[data-key="left"]').forEach(el=>bindTouchKey(el,'ArrowLeft'));
+  controls.querySelectorAll('[data-key="right"]').forEach(el=>bindTouchKey(el,'ArrowRight'));
+  controls.querySelectorAll('[data-key="jump"]').forEach(el=>bindTouchKey(el,'Space'));
+
+  /* ---------- 簡易 Toast ---------- */
+  const toastBox = ensureEl('toastBox','');
+  css(toastBox,{position:'fixed',left:'50%',bottom:'10%',transform:'translateX(-50%)',
+                zIndex:9,color:'#fff',fontWeight:'700',fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,Noto Sans,Arial'});
+  let toastTimer=null;
+  function toast(msg){
+    toastBox.textContent = msg;
+    toastBox.style.background = '#000b';
+    toastBox.style.padding = '8px 12px';
+    toastBox.style.borderRadius = '8px';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>{ toastBox.textContent=''; toastBox.style.padding='0'; }, 1400);
+  }
+
+
+  /* ---------- 玩家面板（裝備欄 / 武器欄 / 寵物） ---------- */
+  // 資料：可擴充的註冊表 + 存檔
+  const GEAR_SAVE_KEY = 'dd_gear_v1';
+
+  // 插件式註冊：裝備定義（之後要加新裝備只要 push）
+  const GEAR_REG = [
+    { id:'cap_wood',    name:'木盔',   slot:'head',  def:1, rarity:'C' },
+    { id:'armor_leath', name:'皮甲',   slot:'body',  def:2, rarity:'C' },
+    { id:'boots_cloth', name:'布靴',   slot:'feet',  def:1, rarity:'C' },
+    { id:'sword_short', name:'短劍',   slot:'weapon',atk:3, rarity:'C' },
+  ];
+
+  // 玩家裝備槽 + 倉庫（stash）
+  const GEAR = window.GEAR || {
+    slots: { head:null, body:null, feet:null, weapon:null },
+    stash: [],               // 尚未裝備的裝備
+    weapons: [],             // 額外武器欄（可當 stash 的別名群組）
+    pets: []                 // 寵物清單（管理用）
+  };
+  (function loadGear(){
+    try{
+      const raw = localStorage.getItem(GEAR_SAVE_KEY)||'';
+      if(raw){ const obj = JSON.parse(raw);
+        if(obj?.slots)  GEAR.slots  = obj.slots;
+        if(obj?.stash)  GEAR.stash  = obj.stash;
+        if(obj?.weapons)GEAR.weapons= obj.weapons;
+        if(obj?.pets)   GEAR.pets   = obj.pets;
+      }
+    }catch{}
+  })();
+  function saveGear(){ try{ localStorage.setItem(GEAR_SAVE_KEY, JSON.stringify(GEAR)); }catch{} }
+  window.GEAR = GEAR; // 暴露給外部插件
+
+  // UI：面板骨架
+  const playerPanel = ensureEl('playerPanel', `
+    <div style="font-weight:800;margin-bottom:8px;display:flex;gap:6px;align-items:center">
+      <span>🧍 玩家</span>
+      <div style="margin-left:auto;display:flex;gap:6px">
+        <button class="pill" data-tab="equip">裝備欄</button>
+        <button class="pill" data-tab="weapon">武器欄</button>
+        <button class="pill" data-tab="pet">寵物</button>
+      </div>
+    </div>
+    <div id="playerTabBody" style="min-width:280px;max-width:42vw"></div>
+  `);
+  css(playerPanel, {
+    position:'fixed', right:'8px', top:'56px', zIndex:7,
+    background:'#0b1024cc', border:'1px solid #ffffff33', borderRadius:'12px',
+    padding:'12px', display:'none'
+  });
+
+  let currentPlayerTab = 'equip';
+  function setTab(tab){
+    currentPlayerTab = tab;
+    playerPanel.querySelectorAll('.pill').forEach(b=>b.classList.toggle('active', b.getAttribute('data-tab')===tab));
+    renderPlayerTab();
+  }
+  playerPanel.querySelectorAll('.pill').forEach(b=>{
+    b.onclick = ()=> setTab(b.getAttribute('data-tab'));
+  });
+
+  // 渲染三分頁
+  function renderPlayerTab(){
+    const body = document.getElementById('playerTabBody');
+    if(!body) return;
+    if(currentPlayerTab==='equip'){
+      body.innerHTML = renderEquipHTML();
+      bindEquipEvents(body);
+    }else if(currentPlayerTab==='weapon'){
+      body.innerHTML = renderWeaponHTML();
+      bindWeaponEvents(body);
+    }else{
+      body.innerHTML = renderPetHTML();
+      bindPetEvents(body);
+    }
+  }
+
+  function renderEquipHTML(){
+    const s = GEAR.slots;
+    const slotLabel = { head:'頭部', body:'身體', feet:'腳部', weapon:'武器' };
+    const slotHtml = Object.keys(s).map(k=>{
+      const v = s[k];
+      const label = slotLabel[k] || k;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;background:#ffffff10;border:1px solid #ffffff22;border-radius:8px;padding:6px 8px;margin:4px 0">
+        <span>${label}</span>
+        <span>${v ? `【${v.name}】` : '—'}</span>
+        <button class="btn grey" data-act="unequip" data-slot="${k}" ${v?'':'disabled'}>卸下</button>
+      </div>`;
+    }).join('');
+
+    const stashHtml = (GEAR.stash||[]).map((it,i)=>
+      `<button class="pill" data-act="equipFromStash" data-idx="${i}" title="點擊裝備">${it.name}（${it.slot}）</button>`
+    ).join(' ') || `<div class="small" style="opacity:.8">尚無裝備，請由「背包＞掉落物」開箱取得。</div>`;
+
+    return `
+      <div style="font-weight:800;margin-bottom:6px">已裝備</div>
+      ${slotHtml}
+      <div style="font-weight:800;margin:10px 0 6px">裝備倉庫</div>
+      <div>${stashHtml}</div>
+    `;
+  }
+  function bindEquipEvents(root){
+    root.querySelectorAll('[data-act="unequip"]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const slot = btn.getAttribute('data-slot');
+        if(!GEAR.slots[slot]) return;
+        GEAR.stash.push(GEAR.slots[slot]);
+        GEAR.slots[slot] = null;
+        saveGear(); renderPlayerTab(); toast('已卸下');
+      };
+    });
+    root.querySelectorAll('[data-act="equipFromStash"]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const idx = +btn.getAttribute('data-idx');
+        const it = GEAR.stash[idx]; if(!it) return;
+        const slot = it.slot;
+        if(GEAR.slots[slot]) GEAR.stash.push(GEAR.slots[slot]); // 先把原本的放回倉庫
+        GEAR.slots[slot] = it;
+        GEAR.stash.splice(idx,1);
+        saveGear(); renderPlayerTab(); toast(`已裝備：${it.name}`);
+      };
+    });
+  }
+
+  function renderWeaponHTML(){
+    const w = GEAR.slots.weapon;
+    const extra = (GEAR.weapons||[]).map((it,i)=>
+      `<button class="pill" data-act="equipWeaponFromList" data-idx="${i}">${it.name}</button>`
+    ).join(' ') || `<div class="small" style="opacity:.8">沒有多餘武器。</div>`;
+    return `
+      <div style="font-weight:800;margin-bottom:6px">主武器</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;background:#ffffff10;border:1px solid #ffffff22;border-radius:8px;padding:6px 8px;margin:4px 0">
+        <span>${w?`【${w.name}】`:'—'}</span>
+        <button class="btn grey" data-act="unequipWeapon" ${w?'':'disabled'}>卸下</button>
+      </div>
+      <div style="font-weight:800;margin:10px 0 6px">武器清單</div>
+      <div>${extra}</div>
+    `;
+  }
+  function bindWeaponEvents(root){
+    const w = GEAR.slots.weapon;
+    const btnU = root.querySelector('[data-act="unequipWeapon"]');
+    if(btnU) btnU.onclick = ()=>{
+      if(!GEAR.slots.weapon) return;
+      GEAR.weapons.push(GEAR.slots.weapon);
+      GEAR.slots.weapon = null;
+      saveGear(); renderPlayerTab(); toast('已卸下主武器');
+    };
+    root.querySelectorAll('[data-act="equipWeaponFromList"]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const idx = +btn.getAttribute('data-idx');
+        const it = GEAR.weapons[idx]; if(!it) return;
+        if(GEAR.slots.weapon) GEAR.weapons.push(GEAR.slots.weapon);
+        GEAR.slots.weapon = it;
+        GEAR.weapons.splice(idx,1);
+        saveGear(); renderPlayerTab(); toast(`已裝備：${it.name}`);
+      };
+    });
+  }
+
+  function renderPetHTML(){
+    const list = (GEAR.pets||[]).map((p,i)=>
+      `<div class="bag-row" style="display:flex;justify-content:space-between;align-items:center;margin:6px 0;padding:6px 8px;border-radius:8px;background:#ffffff10">
+        <span>🐾 ${p.name||('寵物'+(i+1))}</span>
+        <button class="btn grey" data-act="releasePet" data-idx="${i}">放生</button>
+      </div>`
+    ).join('') || `<div class="small" style="opacity:.8">尚無寵物。</div>`;
+    return `
+      <div style="font-weight:800;margin-bottom:6px">寵物管理</div>
+      ${list}
+    `;
+  }
+  function bindPetEvents(root){
+    root.querySelectorAll('[data-act="releasePet"]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const i = +btn.getAttribute('data-idx');
+        GEAR.pets.splice(i,1);
+        saveGear(); renderPlayerTab(); toast('已放生');
+      };
+    });
+  }
+
+  // 按鈕：開關面板
+  if (playerBtn){
+    playerBtn.onclick = ()=>{
+      const on = playerPanel.style.display!=='block';
+      playerPanel.style.display = on ? 'block' : 'none';
+      if(on) { setTab(currentPlayerTab); }
+    };
+  }
+
+  /* ---------- 每幀更新（只負責 UI） ---------- */
+  function uiTick(){
+    updateHud();
+    // 之後可在此同步背包/掉落等顯示
+    requestAnimationFrame(uiTick);
+  }
+  requestAnimationFrame(uiTick);
+
+  /* ---------- 導出 ---------- */
+  Object.assign(window, {
+    saveCheckpoint, loadCheckpoint, refreshBag, showHud
+  });
+
+})(); // Phase 3 IIFE
+</script>
+
+
+<script>
+/* =========================
+   BGM：循環播放（可替換音源）
+   - 預設路徑：bgm.mp3（自行放檔或改 setBGM）
+   - 自動：第一次互動或切到 Play 即嘗試播放
+   - 暴露 window.AUDIO API：setBGM / play / pause / setVolume
+   ========================= */
+(() => {
+  'use strict';
+  const AUDIO = {};
+  let el = new Audio();
+  el.src = 'bgm.mp3'; // ← 可改
+  el.loop = true;
+  el.volume = 0.4;          // 0.0 ~ 1.0
+  let unlocked = false;
+
+  function tryPlay(){
+    el.play().then(()=>{ unlocked = true; }).catch(()=>{ /* 可能被瀏覽器擋，等下一次互動 */ });
+  }
+
+  // 使用者任一互動就嘗試解鎖音訊
+  ['pointerdown','keydown'].forEach(t=>{
+    window.addEventListener(t, tryPlay, { once:true, passive:true });
+  });
+  // 進入遊玩模式時也再嘗試一次
+  window.addEventListener('modechange', e=>{
+    if (e && e.detail && e.detail.mode==='play') tryPlay();
+  });
+
+  AUDIO.setBGM = (url)=>{ el.src = url; if(unlocked) tryPlay(); };
+  AUDIO.play   = ()=> tryPlay();
+  AUDIO.pause  = ()=> el.pause();
+  AUDIO.setVolume = (v)=>{ el.volume = Math.max(0, Math.min(1, v)); };
+
+  window.AUDIO = AUDIO;
+})();
+</script>
+
+
+<script>
+/* =====================================================
+   Phase 4：美術與擴充骨架（Renderer / FX / Hooks）
+   目的：
+   1) 提供通用的「渲染註冊表」與「特效系統」骨架
+   2) 不干擾你既有的主渲染循環（Phase2），純新增 API
+   3) 之後新增品種：只做「資料 + 繪圖函式註冊」即可
+
+   使用方式（之後要加倉鼠/噴火龍）：
+   - ENT['hamster'] = {... 基礎數值/ai...}
+   - SKIN.useEnt('hamster', drawHamster)   // 註冊繪法
+   - ENT['dragon']  = {...}
+   - SKIN.useEnt('dragon',  drawDragon)
+
+   補充：
+   - 這裡提供可選的「皮膚渲染器」與「特效 FX」骨架。
+   - 你目前的 Phase2 已能顯示地圖/玩家；這段不會搶畫面。
+   - 若你想把 Phase4 的皮膚接入主迴圈，可在任何地方呼叫：
+       SKIN.attachTo({
+         enumerateVisible, // 取得可見的 tile 與 entity
+         getCtx,           // 取得 ctx
+         getCamera,        // 取得鏡頭資訊 {x,y,scale}
+       })
+     也可以自己在你的 render() 裡手動呼叫 SKIN.render(ctx, camera, ents, tiles)。
+   ===================================================== */
+(() => {
+  'use strict';
+
+  /* ---------- 取得畫布 / 上下文（不覆蓋，只借用） ---------- */
+  const cv  = document.getElementById('cv');
+  const ctx = cv ? (cv.getContext && cv.getContext('2d')) : null;
+
+  /* ---------- THEME（顏色方案，可換皮） ---------- */
+  const THEME = {
+    bgTop:   '#0e1126',
+    bgBot:   '#1a1f3d',
+    grid:    'rgba(255,255,255,.06)',
+    tile:    '#3e466e',
+    tileEdge:'#5a6494',
+    gold:    '#ffd34e',
+    red:     '#ff6b6b',
+    ui:      '#ffffff'
+  };
+
+  /* ---------- 渲染註冊中心 ---------- */
+  const SKIN = {
+    ent: new Map(),       // type -> draw(ctx, en, t)
+    tile: new Map(),      // key  -> paint(ctx, x, y, size, meta)
+    fx: [],               // 粒子特效池
+    time: 0,
+
+    useEnt(type, fn){ this.ent.set(type, fn); return this; },
+    useTile(key, fn){ this.tile.set(key, fn); return this; },
+
+    // 安全呼叫
+    drawEntSafe(en, t){
+      const fn = this.ent.get(en.type) || defaultEnt;
+      fn && fn(ctx, en, t, THEME);
+    },
+    drawTileSafe(key, x, y, size, meta){
+      const fn = this.tile.get(key) || defaultTile;
+      fn && fn(ctx, x, y, size, meta, THEME);
+    },
+
+    /* ----- FX（最小骨架） ----- */
+    spawnFx(p){ this.fx.push(p); },
+    tickFx(dt){
+      for(let i=this.fx.length-1;i>=0;i--){
+        const f = this.fx[i];
+        f.life -= dt; if(f.life<=0){ this.fx.splice(i,1); continue; }
+        f.x += (f.vx||0) * dt;
+        f.y += (f.vy||0) * dt;
+      }
+    },
+    drawFx(){
+      for(const f of this.fx){
+        ctx.globalAlpha = Math.max(0, Math.min(1, f.life / (f.maxLife||1)));
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, f.r||4, 0, Math.PI*2);
+        ctx.fillStyle = f.color || THEME.gold;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    /* ----- 封裝一個可選的掛接器：讓你無痛接入主渲染 ----- */
+    __attached: null,
+    attachTo(adaptor){
+      // adaptor：{ enumerateVisible, getCtx, getCamera }
+      this.__attached = adaptor;
+      return this;
+    },
+    detach(){ this.__attached = null; },
+
+    /* ----- 提供一個主渲染函式（你可手動呼叫） ----- */
+    render(camera, ents, tiles, tileSize){
+      if(!ctx) return;
+      const t = this.time;
+
+      // 背景（不覆蓋你原本背景，這裡只示範）
+      // 可改為：只畫 FX 與 特殊前景
+      // const g = ctx.createLinearGradient(0,0,0,cv.height);
+      // g.addColorStop(0, THEME.bgTop);
+      // g.addColorStop(1, THEME.bgBot);
+      // ctx.fillStyle = g; ctx.fillRect(0,0,cv.width,cv.height);
+
+      // Tiles（可選：若你不想重畫地面，就不呼叫這段）
+      if (tiles && tileSize){
+        for(const cell of tiles){ // cell: {x,y,key,meta}
+          this.drawTileSafe(cell.key, cell.x, cell.y, tileSize, cell.meta);
+        }
+      }
+
+      // Entities（只畫有註冊的，沒註冊用 defaultEnt）
+      if (ents){
+        for(const en of ents) this.drawEntSafe(en, t);
+      }
+
+      // FX
+      this.drawFx();
+    }
+  };
+  window.SKIN = SKIN; // 導出給全域使用
+
+  /* ---------- 預設繪圖（很簡單，僅骨架） ---------- */
+  function defaultEnt(ctx, en, t, C){
+    // 視覺：灰色小膠囊（示意 hitbox）
+    ctx.save();
+    ctx.translate(en.x + en.w/2, en.y + en.h/2);
+    ctx.fillStyle = 'rgba(255,255,255,.12)';
+    roundRect(ctx, -en.w/2, -en.h/2, en.w, en.h, 6);
+    ctx.fill();
+    ctx.restore();
+  }
+  function defaultTile(ctx, x, y, size, meta, C){
+    ctx.fillStyle = THEME.tile;
+    ctx.fillRect(x, y, size, size);
+    ctx.strokeStyle = THEME.tileEdge;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x+0.5,y+0.5,size-1,size-1);
+  }
+  function roundRect(ctx, x, y, w, h, r){
+    const rr=Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr, y);
+    ctx.arcTo(x+w, y, x+w, y+h, rr);
+    ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr);
+    ctx.arcTo(x, y, x+w, y, rr);
+    ctx.closePath();
+  }
+
+  /* ---------- 範例：註冊幾個常用 Tile 的「美術畫法」 ---------- */
+  SKIN
+    .useTile('#', (ctx, x, y, s, meta, C)=>{ // 地面
+      ctx.fillStyle = THEME.tile; ctx.fillRect(x,y,s,s);
+      ctx.strokeStyle = THEME.tileEdge; ctx.lineWidth=2;
+      ctx.strokeRect(x+0.5,y+0.5,s-1,s-1);
+    })
+    .useTile('o', (ctx, x, y, s, meta, C)=>{ // 金幣
+      ctx.beginPath();
+      ctx.arc(x+s/2, y+s/2, Math.min(10,s*0.22), 0, Math.PI*2);
+      ctx.fillStyle = THEME.gold; ctx.fill();
+      ctx.strokeStyle = '#e5b93c'; ctx.lineWidth=2; ctx.stroke();
+    })
+    .useTile('^', (ctx, x, y, s, meta, C)=>{ // 尖刺
+      ctx.fillStyle = THEME.red;
+      const n=4, w=s/n;
+      for(let i=0;i<n;i++){
+        const bx=x+i*w;
+        ctx.beginPath();
+        ctx.moveTo(bx, y+s);
+        ctx.lineTo(bx+w/2, y+6);
+        ctx.lineTo(bx+w, y+s);
+        ctx.closePath(); ctx.fill();
+      }
+    })
+    .useTile('S', (ctx, x, y, s, meta, C)=>{ // 出生點
+      ctx.fillStyle = '#21d07a';
+      ctx.fillRect(x+6,y+6,s-12,s-12);
+      ctx.fillStyle = '#042';
+      ctx.fillRect(x+10,y+12,s-20,10);
+    })
+
+    });
+
+  /* ---------- Hooks：預留更多交互（之後填入） ---------- */
+  const HOOKS = {
+    onTileEnter: new Map(), // key -> fn(player, gx, gy)
+    onTileStay:  new Map(),
+    onTileExit:  new Map(),
+    useEnter(key, fn){ this.onTileEnter.set(key, fn); return this; },
+    useStay (key, fn){ this.onTileStay.set(key, fn);  return this; },
+    useExit (key, fn){ this.onTileExit.set(key, fn);  return this; },
+  };
+  window.DD_HOOKS = HOOKS;
+
+  // 範例（之後真正要啟用時，在 Phase2 的 tile 檢測處呼叫即可）
+  // HOOKS.useEnter('o', (player,gx,gy)=>{ INVENTORY.coins++; /* 清掉該 tile ... */ });
+
+  /* ---------- 可選：把 Phase4 插入你的渲染循環（非強制） ----------
+     若你想直接使用這組皮膚渲染，可在你的主程式呼叫：
+       SKIN.attachTo({
+         enumerateVisible: () => ({
+           tiles: [ {x,y,key,meta}, ... ],
+           ents:  [ entity, ... ],
+           tileSize: TILE
+         }),
+         getCtx: () => ctx,
+         getCamera: () => ({ x: camX, y: camY, scale: 1 })
+       });
+     下面這個 raf 只會在 attachTo() 之後開始運作。
+  ---------------------------------------------------------------- */
+  (function phase4RenderLoop(){
+    let last=performance.now();
+    function tick(now){
+      const dt = Math.min(0.033, (now-last)/1000); last=now;
+      SKIN.time += dt; SKIN.tickFx(dt);
+
+      if (SKIN.__attached){
+        const { enumerateVisible, getCtx, getCamera } = SKIN.__attached;
+        const out = enumerateVisible ? enumerateVisible() : null;
+        const ktx = getCtx ? getCtx() : ctx;
+        if (ktx && out){
+          ktx.save();
+          const cam = getCamera ? getCamera() : {x:0,y:0,scale:1};
+          ktx.translate(-cam.x*(cam.scale||1), -cam.y*(cam.scale||1));
+          if (cam.scale && cam.scale!==1) ktx.scale(cam.scale, cam.scale);
+
+          // 使用 Phase4 皮膚渲染（只畫註冊內容）
+          SKIN.render(cam, out.ents||[], out.tiles||[], out.tileSize||48);
+
+          ktx.restore();
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  })();
+
+  /* ---------- 便利工具：幫助你之後快速做皮膚 ---------- */
+  function wiggle(base, amp, t, speed=6){ return base + Math.sin(t*speed)*amp; }
+  function drawShadow(x, y, w){
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(x, y, w, 5.5, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /* ---------- （示例）倉鼠 & 噴火龍的皮膚接口：先放空函式 ----------
+     你之後只要：
+       ENT['hamster'] = {...}
+       SKIN.useEnt('hamster', drawHamster);
+     就能有獨立的美術表現（與數值/AI 解耦）。
+  -------------------------------------------------------------- */
+  function drawHamster(ctx, en, t, C){
+    // 範例造型：圓滾滾 + 小耳朵（之後你可替換為更精緻）
+    const r = Math.max(10, Math.min(en.w,en.h)*0.48);
+    const cx = en.x + en.w/2;
+    const cy = en.y + en.h/2 + Math.sin(t*6)*1.2;
+    drawShadow(cx, en.y + en.h, r*0.7);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    // 身體
+    ctx.fillStyle = '#d9a074';
+    ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+    // 白肚
+    ctx.fillStyle = '#fff6ee';
+    ctx.beginPath(); ctx.ellipse(0, r*0.15, r*0.65, r*0.55, 0, 0, Math.PI*2); ctx.fill();
+    // 耳朵
+    ctx.fillStyle = '#c98e63';
+    ctx.beginPath(); ctx.arc(-r*0.55,-r*0.55,r*0.28,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( r*0.55,-r*0.55,r*0.28,0,Math.PI*2); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = '#2b2b2b';
+    ctx.beginPath(); ctx.arc(-r*0.28, -r*0.1, r*0.09, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( r*0.28, -r*0.1, r*0.09, 0, Math.PI*2); ctx.fill();
+    // 鼻子
+    ctx.fillStyle = '#ff6b6b';
+    ctx.beginPath(); ctx.arc(0, r*0.05, r*0.08, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawDragon(ctx, en, t, C){
+    const cx = en.x + en.w/2;
+    const cy = en.y + en.h/2 + Math.sin(t*2)*1.5;
+    const w  = Math.max(20, en.w*0.9), h = Math.max(20, en.h*0.9);
+    drawShadow(cx, en.y + en.h, Math.min(w,h)*0.7);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // 身體
+    ctx.fillStyle = '#4a86e8';
+    ctx.beginPath();
+    ctx.ellipse(0,0,w*0.45,h*0.36,0,0,Math.PI*2);
+    ctx.fill();
+
+    // 翅膀
+    const flap = Math.sin(t*7)*8;
+    ctx.fillStyle = '#6aa8ff';
+    ctx.beginPath(); // 左
+    ctx.moveTo(-w*0.45,0);
+    ctx.quadraticCurveTo(-w*0.85,-h*0.28-flap,-w*0.6,-h*0.55-flap);
+    ctx.quadraticCurveTo(-w*0.2,-h*0.2,-w*0.45,0);
+    ctx.fill();
+
+    ctx.beginPath(); // 右
+    ctx.moveTo(w*0.45,0);
+    ctx.quadraticCurveTo(w*0.85,-h*0.28+flap,w*0.6,-h*0.55+flap);
+    ctx.quadraticCurveTo(w*0.2,-h*0.2,w*0.45,0);
+    ctx.fill();
+
+    // 頭
+    ctx.fillStyle = '#3a73cc';
+    ctx.beginPath();
+    ctx.arc(0,-h*0.48,h*0.22,0,Math.PI*2); ctx.fill();
+
+    // 眼睛
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(-h*0.08,-h*0.50,h*0.06,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( h*0.08,-h*0.50,h*0.06,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#2b2b2b';
+    ctx.beginPath(); ctx.arc(-h*0.08,-h*0.50,h*0.03,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( h*0.08,-h*0.50,h*0.03,0,Math.PI*2); ctx.fill();
+
+    // 火口（僅做亮點，之後可發射彈體）
+    ctx.fillStyle = 'rgba(255,140,0,0.9)';
+    ctx.fillRect(-4,-h*0.42, 8, 6);
+
+    ctx.restore();
+  }
+
+  // 導出方便你之後直接呼叫（不自動註冊任何怪/動物）
+  Object.assign(window, {
+    drawHamster, drawDragon, THEME
+  });
+
+})();
+</script>
+
+//主結構結束
+
+
+
+
+
+
+
+
+//怪獸插件開始
+<!-- ============ Plugin: 西方黑魔龍 v2（巡邏：編輯模式也會動；追擊需遊玩+視線） ============ -->
+<script>
+(() => {
+  'use strict';
+
+  const ENT  = window.ENT  || (window.ENT  = {});
+  const SKIN = window.SKIN || (window.SKIN = { ent:{ get:()=>null }, useEnt:()=>{} });
+
+  /* ========== 世界快照（供碰撞與尺寸） ========== */
+  const SAVEK = 'dd_skel_phase1';
+  let _rawCache=null, _world=null, _lastSnap=0;
+
+  function loadWorldSnapshot(force=false){
+    const now = performance.now();
+    if(!force && now - _lastSnap < 450) return _world;
+    const raw = localStorage.getItem(SAVEK) || '';
+    if(!force && raw === _rawCache) return _world;
+    _lastSnap = now; _rawCache = raw;
+    try{
+      const d = JSON.parse(raw || '{}');
+      const tiles = (d.tileRows||[]).map(r=>r.split(''));
+      const T = d.tileSize || 48;
+      _world = {
+        w: d.w || 40, h: d.h || 24, T, tiles,
+        tileAt(gx,gy){
+          if(gx<0||gy<0||gx>=this.w||gy>=this.h) return '#';
+          const row=this.tiles[gy]||[]; return row[gx]||'.';
+        },
+        isSolidRect(rx,ry,rw,rh){
+          const T=this.T;
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++){
+            for(let x=x0;x<=x1;x++){
+              if(this.tileAt(x,y)==='#') return true;
+            }
+          }
+          return false;
+        }
+      };
+    }catch{
+      _world = { w:40, h:24, T:48, tiles:[],
+        tileAt(){return '.';}, isSolidRect(){return false;}
+      };
+    }
+    return _world;
+  }
+
+  function moveWithCollisions(o, dt){
+    const W = loadWorldSnapshot(); if(!W) return;
+    // 水平
+    let nx = o.x + o.vx*dt;
+    if(!W.isSolidRect(nx, o.y, o.w, o.h)){ o.x = nx; }
+    else{
+      const dir = Math.sign(o.vx)||1;
+      let px=o.x; while(!W.isSolidRect(px+dir, o.y, o.w, o.h)) px+=dir;
+      o.x=px; o.vx=0;
+    }
+    // 垂直
+    let ny = o.y + o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x, ny, o.w, o.h)){ o.y = ny; }
+    else{
+      const dir = Math.sign(o.vy)||1;
+      let py=o.y; while(!W.isSolidRect(o.x, py+dir, o.w, o.h)) py+=dir;
+      o.y=py; if(dir>0) o.onGround=true; o.vy=0;
+    }
+    // 邊界夾限
+    const maxX=W.w*W.T - o.w, maxY=W.h*W.T - o.h;
+    o.x = Math.max(0, Math.min(maxX, o.x));
+    o.y = Math.max(0, Math.min(maxY, o.y));
+  }
+
+  /* ========== 視線（LOS）檢測：路徑中遇到牆（#）視為遮蔽 ========== */
+  function hasLineOfSight(ax,ay,bx,by,W){
+    const dx=bx-ax, dy=by-ay;
+    const dist = Math.hypot(dx,dy)||1;
+    const step = Math.max(4, Math.floor(W.T*0.5)); // 約半格取樣
+    const steps = Math.ceil(dist/step);
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const x = ax + dx*t, y = ay + dy*t;
+      const gx = Math.floor(x/W.T), gy = Math.floor(y/W.T);
+      if(W.tileAt(gx,gy)==='#') return false;
+    }
+    return true;
+  }
+
+  /* ========== 掉落 ========== */
+  const DROP = {
+    coin: { chance: 0.70, min:1, max:3 },
+    loot: { chance: 0.45, min:1, max:2 },
+    meat: { chance: 0.35, min:1, max:1 }
+  };
+  function randInt(a,b){ return Math.floor(a + Math.random()*(b-a+1)); }
+  function tryDrop(kind, inv, x, y, color){
+    const cfg = DROP[kind]; if(!cfg) return 0;
+    if(Math.random() > cfg.chance) return 0;
+    const n = randInt(cfg.min, cfg.max);
+    const key = (kind==='coin' ? 'coins' : kind);
+    inv[key] = (inv[key]|0) + n;
+    try{
+      if(window.SKIN && SKIN.spawnFx){
+        for(let i=0;i<n;i++){
+          SKIN.spawnFx({ x:x+(Math.random()*12-6), y:y-6, vx:(Math.random()*80-40), vy:-60-Math.random()*60,
+            r: kind==='meat'?4:5, color, life:0.5, maxLife:0.5 });
+        }
+      }
+    }catch{}
+    return n;
+  }
+  function dropLootAt(x,y){
+    const INV = window.INVENTORY || (window.INVENTORY = {meat:0, loot:0, coins:0});
+    const c = tryDrop('coin', INV, x,y, 'rgba(255,211,78,0.9)');
+    const l = tryDrop('loot', INV, x,y, 'rgba(160,200,255,0.95)');
+    const m = tryDrop('meat', INV, x,y, 'rgba(255,120,140,0.95)');
+    const box = document.getElementById('toastBox');
+    if(box && (c||l||m)){
+      let msg = ''; if(c) msg += `🪙x${c} `; if(l) msg += `🎁x${l} `; if(m) msg += `🍖x${m}`;
+      box.textContent = `獲得 ${msg.trim()}`;
+      box.style.background='#000b'; box.style.padding='8px 12px'; box.style.borderRadius='8px';
+      clearTimeout(dropLootAt._t); dropLootAt._t = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+    if(typeof window.refreshBag === 'function') window.refreshBag();
+  }
+
+  /* ========== Spritesheet：載入與畫圖器 ========== */
+  const SHEETS = (SKIN.sheets ||= {});
+
+  function registerDragonSheet(url, cols, rows, name='dragon_sheet'){
+    const img = new Image(); img.src = url;
+    SHEETS[name] = { img, cols, rows, ready:false };
+    img.onload = ()=>{ SHEETS[name].ready = true; };
+    return name;
+  }
+  window.registerDragonSheet = registerDragonSheet;
+
+  function makeDragonDrawer(sheetName='dragon_sheet', scale=3){
+    return function drawDragonSheet(ctx, e, now){
+      const sheet = SHEETS[sheetName];
+      if(!sheet || !sheet.ready) return drawBlackHexDragon(ctx, e, now);
+      e._anim ||= {
+        name:'idle', t:0, i:0,
+        map:{
+          idle:   { frames:[0,1,2],     fps:6,  loop:true  },
+          fly:    { frames:[3,4,5,6],   fps:10, loop:true  },
+          attack: { frames:[7,8,9],     fps:9,  loop:false, next:'fly' },
+          hit:    { frames:[10],        fps:1,  loop:false, next:'fly' },
+          die:    { frames:[11],        fps:6,  loop:false }
+        }
+      };
+      e._anim.t += (e._dt||0.016);
+      const A = e._anim.map[e._anim.name] || e._anim.map.fly;
+      e._anim.i += A.fps*(e._dt||0.016);
+      let frame = A.frames[Math.floor(e._anim.i)%A.frames.length];
+      if(!A.loop && e._anim.i >= A.frames.length){
+        e._anim.name = A.next || 'fly'; e._anim.i = 0;
+        frame = (e._anim.map[e._anim.name]||A).frames[0];
+      }
+      const cols = sheet.cols|0||4, rows = sheet.rows|0||3;
+      const fw = sheet.img.width/cols, fh = sheet.img.height/rows;
+      const sx = (frame%cols)*fw, sy = Math.floor(frame/cols)*fh;
+
+      const drawW = Math.max(fw*scale, e.w*1.2);
+      const drawH = Math.max(fh*scale, e.h*1.2);
+
+      ctx.save();
+      if(e._flash>0){ ctx.globalAlpha=0.65; e._flash--; }
+      ctx.translate(e.x + e.w/2, e.y + e.h/2);
+      ctx.scale(e.face>=0 ? 1 : -1, 1);
+      ctx.drawImage(sheet.img, sx, sy, fw, fh, -drawW/2, -drawH/2, drawW, drawH);
+      ctx.restore();
+    };
+  }
+  window.makeDragonDrawer = makeDragonDrawer;
+
+  /* ========== 佔位黑魔龍（無素材也能看到按鈕＆畫面） ========== */
+  function drawBlackHexDragon(ctx, e, t){
+    const cx=e.x+e.w/2, cy=e.y+e.h/2 + Math.sin(t*2)*1.5;
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(e.x+e.w/2, e.y+e.h, Math.min(e.w,e.h)*0.5, Math.min(e.w,e.h)*0.18, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.translate(cx, cy); ctx.scale(e.face>=0?1:-1, 1);
+    const flap = Math.sin(t*7)*8;
+    ctx.fillStyle = '#0C1E5A';
+    ctx.beginPath(); ctx.moveTo(-e.w*0.46,-e.h*0.05);
+    ctx.quadraticCurveTo(-e.w*0.9,-e.h*0.28-flap,-e.w*0.64,-e.h*0.55-flap);
+    ctx.lineTo(-e.w*0.42,-e.h*0.22); ctx.lineTo(-e.w*0.58,-e.h*0.08); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo( e.w*0.46,-e.h*0.05);
+    ctx.quadraticCurveTo( e.w*0.9,-e.h*0.28+flap, e.w*0.64,-e.h*0.55+flap);
+    ctx.lineTo( e.w*0.42,-e.h*0.22); ctx.lineTo( e.w*0.58,-e.h*0.08); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#14141A';
+    ctx.beginPath(); ctx.ellipse(0,0, e.w*0.46, e.h*0.38, 0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#2F3A4A';
+    ctx.beginPath(); ctx.ellipse(0, -e.h*0.02, e.w*0.30, e.h*0.26, 0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#F04A2F';
+    ctx.beginPath(); ctx.ellipse(12, -e.h*0.42, 4,3, 0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(185,236,255,0.95)';
+    ctx.beginPath(); ctx.ellipse(18, -e.h*0.36, 7,5, 0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  /* ========== 噴火龍（西方黑魔龍）本體 ========== */
+  const DRAGON_BASE = {
+    label:'噴火龍',
+    kind: 'monster',
+    ai:   'dragon',
+    stats:{
+      hp: 60,
+      atk: 16,
+      spd: 160,         // 追擊速度
+      patrolSpd: 90,    // 巡邏速度
+      hover: 0.9,
+      accelY: 520,
+      dampY: 0.90,
+      touchCD: 0.70,
+      knockVx: 380,
+      knockVy: 520
+    }
+  };
+
+  function ensureInit(e){
+    const W = loadWorldSnapshot(); if(!W) return;
+    if(!e._init){
+      e._init = true;
+      e.hp = (typeof e.hp==='number') ? e.hp : DRAGON_BASE.stats.hp;
+
+      // 外觀尺寸（碰撞盒略小）
+      e.sizeTiles = e.sizeTiles || { w:1, h:1 };
+      const T=W.T;
+      e.w = Math.floor(e.sizeTiles.w * T * 0.78);
+      e.h = Math.floor(e.sizeTiles.h * T * 0.78);
+
+      // 移動/狀態
+      e.vx ||= 0; e.vy ||= 0; e.face ||= 1; e._cool ||= 0;
+      e._state = 'patrol';          // patrol | chase | die
+      e._spawn = { x:e.x, y:e.y };
+      e._patrolDir = Math.random()<0.5 ? -1 : 1;
+      e._patrolSpan = (e.patrolSpanTiles||3) * T; // 左右擺動半徑
+      e._detectRadiusM = (e.detectRadiusM ?? 15); // 15 公尺
+      e._metersPerTile = (e.metersPerTile ?? 1);  // 1 格 ≈ 1 公尺
+      e._lostSightTimer = 0;
+      e._hoverPhase = Math.random()*Math.PI*2;
+    }
+  }
+
+  // 只在「遊玩模式」才安全取得玩家，避免在編輯模式誤生成玩家
+  function getPlayerIfPlaying(){
+    try{
+      if (typeof window.__getMode === 'function' && window.__getMode() === 'play' &&
+          typeof window.__ensurePlayer === 'function'){
+        return window.__ensurePlayer();
+      }
+    }catch{}
+    return null;
+  }
+
+  ENT.dragon = {
+    label: DRAGON_BASE.label,
+    kind:  DRAGON_BASE.kind,
+    ai:    DRAGON_BASE.ai,
+    stats: { ...DRAGON_BASE.stats },
+
+    spawn(opts={}){
+      const W = loadWorldSnapshot(); const T=W?W.T:48;
+      const e = {
+        x: opts.x||0, y: opts.y||0,
+        vx:0, vy:0, face:1, hp:opts.hp||DRAGON_BASE.stats.hp,
+        sizeTiles: opts.sizeTiles || { w:3, h:3 },
+        patrolSpanTiles: opts.patrolSpanTiles || 3,
+        detectRadiusM: opts.detectRadiusM || 15,
+        metersPerTile: opts.metersPerTile || 1
+      };
+      return e;
+    },
+
+    render(ctx, e){
+      const now = performance.now()/1000;
+      const dt  = Math.min(0.033, Math.max(0.001, now - (e._last||now)));
+      e._last   = now; e._dt = dt;
+
+      if(e._dead){
+        if(!e._dieAt) e._dieAt = now;
+        if(now - e._dieAt > 0.40){
+          e.x = e.y = -1e6; e.w = e.h = 0; e.vx = e.vy = 0;
+        }
+        return;
+      }
+
+      ensureInit(e);
+      const W = loadWorldSnapshot(); if(!W) return;
+
+      // ===== AI：巡邏（編輯/遊玩都跑） + 視線追擊（僅遊玩且看得到玩家） =====
+      const T = W.T;
+      const meterToPx = T / (e._metersPerTile || 1);
+      const radiusPx = (e._detectRadiusM || 15) * meterToPx;
+
+      const p = getPlayerIfPlaying(); // 編輯模式時為 null
+      const ex = e.x + e.w/2, ey = e.y + e.h/2;
+      const hover = (DRAGON_BASE.stats.hover + 0.25*Math.sin(now*0.7 + e._hoverPhase)) * T;
+
+      let canSee = false, dx=0, dy=0, dist=0;
+      if (p){
+        const px = p.x + p.w/2, py = p.y + p.h/2;
+        dx = px - ex; dy = py - ey; dist = Math.hypot(dx,dy);
+        canSee = (dist <= radiusPx) && hasLineOfSight(ex,ey, px,py, W);
+      }
+
+      if(e._state==='patrol'){
+        // 永遠巡邏（編輯模式也會）
+        const targetX = e._spawn.x + e._patrolDir * e._patrolSpan;
+        const dir = Math.sign(targetX - e.x) || e._patrolDir;
+        e.vx = dir * DRAGON_BASE.stats.patrolSpd;
+        e.vy += ((e._spawn.y - hover) - (e.y + e.h/2) > 0 ? 1 : -1) * DRAGON_BASE.stats.accelY * dt;
+        e.vy *= DRAGON_BASE.stats.dampY;
+        moveWithCollisions(e, dt);
+        e.face = (e.vx>=0 ? 1 : -1);
+        if(Math.abs(e.x - targetX) < 6 || W.isSolidRect(e.x + dir*8, e.y, e.w, e.h)) e._patrolDir *= -1;
+
+        // 只有「遊玩＋可見玩家」才進入追擊
+        if(canSee){
+          e._state='chase'; if(e._anim){ e._anim.name='fly'; e._anim.i=0; }
+        }
+      }else if(e._state==='chase'){
+        // 沒玩家（例如切回編輯）就退回巡邏
+        if(!p){ e._state='patrol'; if(e._anim){ e._anim.name='idle'; e._anim.i=0; } }
+        else{
+          if(canSee){
+            e._lostSightTimer = 0;
+            const SPD = DRAGON_BASE.stats.spd;
+            e.vx = Math.sign(dx) * SPD;
+            const tgtY = (p.y + p.h/2) - hover;
+            e.vy += ((tgtY > (e.y+e.h/2)) ? 1 : -1) * DRAGON_BASE.stats.accelY * dt;
+            e.vy *= DRAGON_BASE.stats.dampY;
+            moveWithCollisions(e, dt);
+            e.face = (dx>=0 ? 1 : -1);
+
+            // 近身碰撞 → 傷害 + 擊退（冷卻）
+            if (e._cool > 0) e._cool -= dt;
+            const touchR = Math.max(32, T*0.9);
+            if (dist < touchR && e._cool <= 0){
+              const ps = window.ENT && window.ENT.player && window.ENT.player.stats;
+              if (ps){
+                const raw = DRAGON_BASE.stats.atk;
+                const mitig = Math.max(0, raw - (ps.def||0)*0.5);
+                ps.hp = Math.max(0, ps.hp - mitig);
+              }
+              const dir = Math.sign((p.x+p.w/2)-ex) || 1;
+              p.vx = dir * DRAGON_BASE.stats.knockVx;
+              p.vy = -DRAGON_BASE.stats.knockVy;
+              e._cool = DRAGON_BASE.stats.touchCD;
+              if(e._anim){ e._anim.name='attack'; e._anim.i=0; }
+              if(SKIN.spawnFx){
+                for(let i=0;i<8;i++){
+                  SKIN.spawnFx({
+                    x: ex + (Math.random()*12-6),
+                    y: ey + (Math.random()*8-4),
+                    vx: (dir*120)+(Math.random()*80-40), vy: -40-Math.random()*60,
+                    r: 3+Math.random()*3, color:'rgba(255,120,40,0.9)', life:0.35, maxLife:0.35
+                  });
+                }
+              }
+            }
+          }else{
+            e._lostSightTimer += dt;
+            if(e._lostSightTimer > 1.2){
+              e._state='patrol'; e._lostSightTimer=0;
+              if(e._anim){ e._anim.name='idle'; e._anim.i=0; }
+            }else{
+              const dir = Math.sign(dx)||e.face;
+              e.vx = dir * (DRAGON_BASE.stats.patrolSpd*0.8);
+              e.vy *= DRAGON_BASE.stats.dampY;
+              moveWithCollisions(e, dt);
+            }
+          }
+        }
+      }
+
+      // --- 受擊盒（DD_HITBOX） ---
+      if (!e._hb && window.DD_HITBOX){
+        e._hb = DD_HITBOX.track(e, {
+          team: 'enemy',
+          getBounds: ()=>({ x:e.x, y:e.y, w:e.w, h:e.h }),
+          getHP: ()=> e.hp,
+          setHP: v => { e.hp = v; },
+          iframes: 0.12,
+          knock: { force: 420 },
+          getVel: ()=>({ vx:e.vx||0, vy:e.vy||0 }),
+          setVel: (vx,vy)=>{ e.vx=vx; e.vy=vy; },
+          onHit:   (en)=>{ en._flash = 8; if(en._anim){ en._anim.name='hit'; en._anim.i=0; } },
+          onDeath: (en)=>{
+            const cx = en.x + en.w/2, cy = en.y + en.h/2;
+            dropLootAt(cx, cy);
+            try{
+              if(window.SKIN && SKIN.spawnFx){
+                SKIN.spawnFx({ x:cx, y:cy, r:24, vx:0, vy:-60, color:'rgba(255,200,40,0.95)', life:0.30, maxLife:0.30 });
+                SKIN.spawnFx({ x:cx, y:cy, r:16, vx:0, vy:0, color:'rgba(90,0,120,0.85)', life:0.22, maxLife:0.22 });
+              }
+            }catch{}
+            en._dead = true;
+            if(en._anim){ en._anim.name='die'; en._anim.i=0; }
+          }
+        });
+      }
+
+      // --- 視覺：spritesheet 或佔位黑魔龍 ---
+      const drawer = SKIN && SKIN.ent && SKIN.ent.get && SKIN.ent.get('dragon');
+      if (typeof drawer === 'function'){
+        try{ drawer(ctx, e, now, window.THEME); return; }catch{}
+      }
+      drawBlackHexDragon(ctx, e, now);
+    }
+  };
+
+  /* ========== 皮膚註冊：先掛上佔位畫法，保證調色盤有「噴火龍」 ========== */
+  if (SKIN && SKIN.useEnt && (!SKIN.ent.get || !SKIN.ent.get('dragon'))){
+    SKIN.useEnt('dragon', drawBlackHexDragon);
+  }
+
+  /* ========== 調色盤刷新（若怪物分頁已開） ========== */
+  const monsBtn = document.querySelector('#palette .pill[data-cat="monsters"]');
+  if (monsBtn && monsBtn.classList.contains('active')) monsBtn.click();
+
+  /* ====== 備註 =========================================================
+   * - 現在「編輯模式」放上去就會巡邏；切到「遊玩」且看得到玩家時才追擊。
+   * - 若日後需要在編輯模式也有追擊，可把 getPlayerIfPlaying() 改為回傳
+   *   你自己的 Dummy 玩家、或提供一個 Showroom 模式專用的虛擬目標。
+   * =================================================================== */
+})();
+</script>
+<!-- ============ /Plugin: 西方黑魔龍結束v2 ============ -->
+
+
+<!-- ============ Plugin: 史萊姆（可合體：低血時聚集→巨大化） ============ -->
+<script>
+(() => {
+  'use strict';
+
+  const ENT  = window.ENT  || (window.ENT  = {});
+  const SKIN = window.SKIN || (window.SKIN = { ent:{ get:()=>null }, useEnt:()=>{} });
+
+  /* ========== 世界快照（供碰撞與尺寸） ========== */
+  const SAVEK = 'dd_skel_phase1';
+  let _rawCache=null, _world=null, _lastSnap=0;
+
+  function loadWorldSnapshot(force=false){
+    const now = performance.now();
+    if(!force && now - _lastSnap < 450) return _world;
+    const raw = localStorage.getItem(SAVEK) || '';
+    if(!force && raw === _rawCache) return _world;
+    _lastSnap = now; _rawCache = raw;
+    try{
+      const d = JSON.parse(raw || '{}');
+      const tiles = (d.tileRows||[]).map(r=>r.split(''));
+      const T = d.tileSize || 48;
+      _world = {
+        w: d.w || 40, h: d.h || 24, T, tiles,
+        tileAt(gx,gy){
+          if(gx<0||gy<0||gx>=this.w||gy>=this.h) return '#';
+          const row=this.tiles[gy]||[]; return row[gx]||'.';
+        },
+        isSolidRect(rx,ry,rw,rh){
+          const T=this.T;
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++){
+            for(let x=x0;x<=x1;x++){
+              if(this.tileAt(x,y)==='#') return true;
+            }
+          }
+          return false;
+        }
+      };
+    }catch{
+      _world = { w:40, h:24, T:48, tiles:[],
+        tileAt(){return '.';}, isSolidRect(){return false;}
+      };
+    }
+    return _world;
+  }
+
+  function moveWithCollisions(o, dt){
+    const W = loadWorldSnapshot(); if(!W) return;
+    // 水平
+    let nx = o.x + o.vx*dt;
+    if(!W.isSolidRect(nx, o.y, o.w, o.h)){ o.x = nx; }
+    else{
+      const dir = Math.sign(o.vx)||1;
+      let px=o.x; while(!W.isSolidRect(px+dir, o.y, o.w, o.h)) px+=dir;
+      o.x=px; o.vx=0;
+    }
+    // 垂直（簡單重力/彈性落地）
+    o.vy += (o._grav||900) * dt;
+    let ny = o.y + o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x, ny, o.w, o.h)){ o.y = ny; }
+    else{
+      const dir = Math.sign(o.vy)||1;
+      let py=o.y; while(!W.isSolidRect(o.x, py+dir, o.w, o.h)) py+=dir;
+      o.y=py; if(dir>0){ o.onGround=true; o.vy = -Math.abs(o.vy)* (o._bounce||0.12); if(Math.abs(o.vy)<30) o.vy=0; } else { o.vy=0; }
+    }
+    // 邊界夾限
+    const maxX=W.w*W.T - o.w, maxY=W.h*W.T - o.h;
+    o.x = Math.max(0, Math.min(maxX, o.x));
+    o.y = Math.max(0, Math.min(maxY, o.y));
+  }
+
+  /* ========== 視線（LOS）檢測：可選（史萊姆近戰為主） ========== */
+  function hasLineOfSight(ax,ay,bx,by,W){
+    const dx=bx-ax, dy=by-ay;
+    const dist = Math.hypot(dx,dy)||1;
+    const step = Math.max(4, Math.floor(W.T*0.5));
+    const steps = Math.ceil(dist/step);
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const x = ax + dx*t, y = ay + dy*t;
+      const gx = Math.floor(x/W.T), gy = Math.floor(y/W.T);
+      if(W.tileAt(gx,gy)==='#') return false;
+    }
+    return true;
+  }
+
+  /* ========== 掉落（與龍版一致） ========== */
+  const DROP = {
+    coin: { chance: 0.60, min:1, max:3 },
+    loot: { chance: 0.35, min:1, max:2 },
+    meat: { chance: 0.25, min:1, max:1 }
+  };
+  function randInt(a,b){ return Math.floor(a + Math.random()*(b-a+1)); }
+  function tryDrop(kind, inv, x, y, color){
+    const cfg = DROP[kind]; if(!cfg) return 0;
+    if(Math.random() > cfg.chance) return 0;
+    const n = randInt(cfg.min, cfg.max);
+    const key = (kind==='coin' ? 'coins' : kind);
+    inv[key] = (inv[key]|0) + n;
+    try{
+      if(window.SKIN && SKIN.spawnFx){
+        for(let i=0;i<n;i++){
+          SKIN.spawnFx({ x:x+(Math.random()*12-6), y:y-6, vx:(Math.random()*80-40), vy:-60-Math.random()*60,
+            r: kind==='meat'?4:5, color, life:0.5, maxLife:0.5 });
+        }
+      }
+    }catch{}
+    return n;
+  }
+  function dropLootAt(x,y){
+    const INV = window.INVENTORY || (window.INVENTORY = {meat:0, loot:0, coins:0});
+    const c = tryDrop('coin', INV, x,y, 'rgba(255,211,78,0.9)');
+    const l = tryDrop('loot', INV, x,y, 'rgba(160,200,255,0.95)');
+    const m = tryDrop('meat', INV, x,y, 'rgba(120,255,170,0.95)');
+    const box = document.getElementById('toastBox');
+    if(box && (c||l||m)){
+      let msg = ''; if(c) msg += `🪙x${c} `; if(l) msg += `🎁x${l} `; if(m) msg += `🍖x${m}`;
+      box.textContent = `獲得 ${msg.trim()}`;
+      box.style.background='#000b'; box.style.padding='8px 12px'; box.style.borderRadius='8px';
+      clearTimeout(dropLootAt._t); dropLootAt._t = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 900);
+    }
+    if(typeof window.refreshBag === 'function') window.refreshBag();
+  }
+
+  /* ========== Spritesheet（可選） ========== */
+  const SHEETS = (SKIN.sheets ||= {});
+  function registerSlimeSheet(url, cols, rows, name='slime_sheet'){
+    const img = new Image(); img.src = url;
+    SHEETS[name] = { img, cols, rows, ready:false };
+    img.onload = ()=>{ SHEETS[name].ready = true; };
+    return name;
+  }
+  window.registerSlimeSheet = registerSlimeSheet;
+
+  function makeSlimeDrawer(sheetName='slime_sheet', scale=1.8){
+    return function drawSlimeSheet(ctx, e, now){
+      const sheet = SHEETS[sheetName];
+      if(!sheet || !sheet.ready) return drawGreenBlob(ctx, e, now);
+      e._anim ||= {
+        name:'idle', t:0, i:0,
+        map:{
+          idle:   { frames:[0,1,2,1],       fps:5,  loop:true  },
+          hop:    { frames:[3,4,5,4],       fps:8,  loop:true  },
+          merge:  { frames:[6,7,8,9],       fps:9,  loop:false, next:'idle' },
+          hit:    { frames:[10],            fps:1,  loop:false, next:'idle' },
+          die:    { frames:[11],            fps:6,  loop:false }
+        }
+      };
+      e._anim.t += (e._dt||0.016);
+      const A = e._anim.map[e._anim.name] || e._anim.map.idle;
+      e._anim.i += A.fps*(e._dt||0.016);
+      let frame = A.frames[Math.floor(e._anim.i)%A.frames.length];
+      if(!A.loop && e._anim.i >= A.frames.length){
+        e._anim.name = A.next || 'idle'; e._anim.i = 0;
+        frame = (e._anim.map[e._anim.name]||A).frames[0];
+      }
+      const cols = sheet.cols|0||4, rows = sheet.rows|0||3;
+      const fw = sheet.img.width/cols, fh = sheet.img.height/rows;
+      const sx = (frame%cols)*fw, sy = Math.floor(frame/cols)*fh;
+
+      const drawW = Math.max(fw*scale*(1+0.25*(e._stack-1)), e.w*1.05);
+      const drawH = Math.max(fh*scale*(1+0.20*(e._stack-1)), e.h*1.05);
+
+      ctx.save();
+      if(e._flash>0){ ctx.globalAlpha=0.65; e._flash--; }
+      ctx.translate(e.x + e.w/2, e.y + e.h/2 + Math.sin(now*6 + e._phase)*2);
+      ctx.drawImage(sheet.img, sx, sy, fw, fh, -drawW/2, -drawH/2, drawW, drawH);
+      ctx.restore();
+    };
+  }
+  window.makeSlimeDrawer = makeSlimeDrawer;
+
+  /* ========== 佔位：綠色膠史萊姆 ========== */
+  function drawGreenBlob(ctx, e, t){
+    const cx=e.x+e.w/2, cy=e.y+e.h/2;
+    // 地影
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.ellipse(e.x+e.w/2, e.y+e.h, Math.max(12,e.w*0.46), Math.max(6,e.h*0.18), 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(cx, cy + Math.sin(t*6 + e._phase)*2);
+    const rX = e.w*0.45, rY = e.h*0.35;
+    // 外光
+    const g = ctx.createRadialGradient(0,-rY*0.3, rX*0.1, 0,0, rX);
+    g.addColorStop(0,'rgba(120,255,170,0.95)');
+    g.addColorStop(1,'rgba(60,160,110,0.85)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(0,0,rX,rY,0,0,Math.PI*2); ctx.fill();
+
+    // 高光
+    ctx.globalAlpha=0.7;
+    ctx.fillStyle='rgba(255,255,255,0.75)';
+    ctx.beginPath(); ctx.ellipse(-rX*0.25, -rY*0.35, rX*0.25, rY*0.18, 0,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+
+    // 臉
+    ctx.fillStyle='#0b1e10';
+    ctx.beginPath(); ctx.arc(-rX*0.18, -rY*0.05, 3+2*(e._stack-1), 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( rX*0.18, -rY*0.05, 3+2*(e._stack-1), 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle='#143d20';
+    ctx.beginPath(); ctx.ellipse(0, rY*0.20, rX*0.20, rY*0.10, 0, 0, Math.PI); ctx.fill();
+    ctx.restore();
+  }
+
+  /* ========== 工具：玩家（僅遊玩模式才取） ========== */
+  function getPlayerIfPlaying(){
+    try{
+      if (typeof window.__getMode === 'function' && window.__getMode() === 'play' &&
+          typeof window.__ensurePlayer === 'function'){
+        return window.__ensurePlayer();
+      }
+    }catch{}
+    return null;
+  }
+
+  /* ========== 全域：把在場史萊姆收錄以便互相尋找 ========== */
+  const SL_POOL = new Set(); // 存放 entity 參考
+  function poolAdd(e){ SL_POOL.add(e); }
+  function poolDel(e){ SL_POOL.delete(e); }
+  function forEachSlimeNear(e, radiusPx, cb){
+    const ex = e.x + e.w/2, ey = e.y + e.h/2;
+    for(const other of SL_POOL){
+      if(other===e || other._dead) continue;
+      const ox = other.x + other.w/2, oy = other.y + other.h/2;
+      const d = Math.hypot(ox-ex, oy-ey);
+      if(d <= radiusPx) cb(other, d);
+    }
+  }
+
+  /* ========== 史萊姆本體 ========== */
+  const SLIME_BASE = {
+    label:'史萊姆',
+    kind: 'monster',
+    ai:   'slime',
+    stats:{
+      hp: 30,
+      atk: 8,
+      spd: 90,          // 巡邏/靠攏速度
+      chaseSpd: 120,    // 追玩家
+      touchCD: 0.8,
+      knockVx: 280,
+      knockVy: 420
+    }
+  };
+
+  function ensureInit(e){
+    const W = loadWorldSnapshot(); if(!W) return;
+    if(!e._init){
+      e._init = true;
+      e.hp = (typeof e.hp==='number') ? e.hp : SLIME_BASE.stats.hp;
+      e.maxHp = e.maxHp || e.hp;
+      e._stack = e._stack || 1;        // 合體數（包含自己）
+      e._phase = Math.random()*Math.PI*2;
+      e.sizeTiles = e.sizeTiles || { w:1, h:1 };
+
+      const T=W.T;
+      const scale = 1 + 0.55*(e._stack-1);
+      e.w = Math.floor(e.sizeTiles.w * T * 0.72 * scale);
+      e.h = Math.floor(e.sizeTiles.h * T * 0.62 * scale);
+
+      e.vx ||= 0; e.vy ||= 0; e.face ||= 1; e._cool ||= 0;
+      e._state = 'wander';   // wander | chase | merge_seek | die
+      e._grav = 900; e._bounce = 0.14;
+      e._spawn = { x:e.x, y:e.y };
+      poolAdd(e);
+    }
+  }
+
+  function applyStackScaling(e){
+    // 依合體數調整 size / 攻擊 / 觸碰半徑 / HP 上限
+    const W = loadWorldSnapshot(); const T=W?W.T:48;
+    const scale = 1 + 0.55*(e._stack-1);
+    e.w = Math.floor((e.sizeTiles?.w||1) * T * 0.72 * scale);
+    e.h = Math.floor((e.sizeTiles?.h||1) * T * 0.62 * scale);
+    e._touchR = Math.max(22, Math.min(120, T*0.6 * scale));
+    e._atkNow = Math.round(SLIME_BASE.stats.atk * (1 + 0.70*(e._stack-1)));
+    e.maxHp   = Math.round((e.maxHp||SLIME_BASE.stats.hp) * (1 + 0.90*(e._stack-1)));
+    // 不直接回滿：保留當前 hp 比例
+    const ratio = Math.max(0.05, Math.min(1, e.hp / Math.max(1,e.maxHp)));
+    e.hp = Math.max(1, Math.round(ratio * e.maxHp));
+  }
+
+  // 合體：leader 吸收 target（target 被標記死亡/淡出）
+  function absorb(leader, target){
+    if(leader._dead || target._dead) return false;
+    // 僅在雙方都「可合體」時吸收（hp ≤ 30%）
+    const ready = (x)=> (x.hp / Math.max(1,x.maxHp)) <= 0.30;
+    if(!ready(leader) || !ready(target)) return false;
+
+    leader._stack = (leader._stack|0) + (target._stack|0||1);
+    leader.maxHp  = Math.round(leader.maxHp + target.maxHp);
+    leader.hp     = Math.min(leader.maxHp, leader.hp + Math.round(target.hp*0.8)); // 帶點保留
+    applyStackScaling(leader);
+    leader._anim && (leader._anim.name='merge', leader._anim.i=0);
+    // target 消失（掉一點 goo 特效）
+    try{
+      if(window.SKIN && SKIN.spawnFx){
+        const cx = target.x+target.w/2, cy=target.y+target.h/2;
+        for(let i=0;i<10;i++){
+          SKIN.spawnFx({ x:cx+(Math.random()*8-4), y:cy+(Math.random()*6-3),
+            vx:(Math.random()*160-80), vy:-30-Math.random()*80, r:3+Math.random()*3,
+            color:'rgba(120,255,170,0.9)', life:0.4, maxLife:0.4 });
+        }
+      }
+    }catch{}
+    // 標記死亡→淡出
+    target._dead = true; target._dieAt = performance.now()/1000;
+    target.w = Math.max(1, target.w*0.6); target.h = Math.max(1, target.h*0.6);
+    return true;
+  }
+
+  ENT.slime = {
+    label: SLIME_BASE.label,
+    kind:  SLIME_BASE.kind,
+    ai:    SLIME_BASE.ai,
+    stats: { ...SLIME_BASE.stats },
+
+    spawn(opts={}){
+      const W = loadWorldSnapshot(); const T=W?W.T:48;
+      const e = {
+        x: opts.x||0, y: opts.y||0,
+        vx:0, vy:0, face:1,
+        hp: opts.hp||SLIME_BASE.stats.hp,
+        maxHp: opts.maxHp||SLIME_BASE.stats.hp,
+        sizeTiles: opts.sizeTiles || { w:1, h:1 },
+        _stack: opts.stack||1
+      };
+      return e;
+    },
+
+    render(ctx, e){
+      const now = performance.now()/1000;
+      const dt  = Math.min(0.033, Math.max(0.001, now - (e._last||now)));
+      e._last   = now; e._dt = dt;
+
+      if(e._dead){
+        poolDel(e);
+        if(!e._dieAt) e._dieAt = now;
+        ctx.save(); const k = Math.max(0, 1 - (now - e._dieAt)/0.35);
+        ctx.globalAlpha = k; drawGreenBlob(ctx, e, now); ctx.restore();
+        if(now - e._dieAt > 0.40){
+          e.x = e.y = -1e6; e.w = e.h = 0; e.vx = e.vy = 0;
+        }
+        return;
+      }
+
+      ensureInit(e);
+      applyStackScaling(e);
+      const W = loadWorldSnapshot(); if(!W) return;
+
+      const T = W.T;
+      const p = getPlayerIfPlaying(); // 編輯模式時為 null
+      const ex = e.x + e.w/2, ey = e.y + e.h/2;
+
+      // ===== 狀態機 =====
+      const lowHP = (e.hp / Math.max(1,e.maxHp)) <= 0.30;
+
+      if(lowHP && e._state!=='merge_seek') e._state='merge_seek';
+      if(!p && e._state==='chase') e._state='wander';
+
+      // ---- Wander（編輯/遊玩都會晃）----
+      if(e._state==='wander'){
+        // 偶爾小跳/左或右
+        e._wanderT = (e._wanderT||0) - dt;
+        if(e._wanderT<=0){
+          e._wanderT = 0.6 + Math.random()*0.8;
+          const dir = (Math.random()<0.5?-1:1);
+          e.vx = dir * SLIME_BASE.stats.spd * (0.4+Math.random()*0.5);
+          if(e.onGround) e.vy = - (220 + Math.random()*120);
+          e.face = dir;
+          e._anim && (e._anim.name='hop', e._anim.i=0);
+        }
+        moveWithCollisions(e, dt);
+
+        // 若看得到玩家就追（只在遊玩）
+        if(p){
+          const px=p.x+p.w/2, py=p.y+p.h/2;
+          const canSee = hasLineOfSight(ex,ey, px,py, W) && Math.hypot(px-ex,py-ey) < T*10;
+          if(canSee) e._state='chase';
+        }
+      }
+
+      // ---- Chase（只在遊玩）----
+      else if(e._state==='chase' && p){
+        const px=p.x+p.w/2, py=p.y+p.h/2;
+        const dx = px - ex, dy = py - ey;
+        const spd = SLIME_BASE.stats.chaseSpd * (1 + 0.15*(e._stack-1));
+        e.vx += Math.sign(dx) * spd * 0.04; // 橫向黏
+        e.vx = Math.max(-spd, Math.min(spd, e.vx));
+        if(e.onGround && Math.abs(dy) > T*0.3) e.vy = - (240 + 30*(e._stack-1)); // 小跳
+        moveWithCollisions(e, dt);
+        e.face = (dx>=0?1:-1);
+
+        // 近身觸碰傷害＋擊退（CD）
+        if (e._cool > 0) e._cool -= dt;
+        const dist = Math.hypot(px-ex, py-ey);
+        if (dist < (e._touchR||T*0.6) && e._cool <= 0){
+          const ps = window.ENT && window.ENT.player && window.ENT.player.stats;
+          if (ps){
+            const raw = e._atkNow||SLIME_BASE.stats.atk;
+            const mitig = Math.max(0, raw - (ps.def||0)*0.4);
+            ps.hp = Math.max(0, ps.hp - mitig);
+          }
+          const dir = Math.sign(px-ex) || 1;
+          p.vx = dir * SLIME_BASE.stats.knockVx * (0.9 + 0.25*(e._stack-1));
+          p.vy = -SLIME_BASE.stats.knockVy * (0.9 + 0.20*(e._stack-1));
+          e._cool = SLIME_BASE.stats.touchCD * 0.85;
+          e._anim && (e._anim.name='hit', e._anim.i=0);
+          if(SKIN.spawnFx){
+            for(let i=0;i<6+2*(e._stack-1);i++){
+              SKIN.spawnFx({
+                x: ex + (Math.random()*12-6),
+                y: ey + (Math.random()*8-4),
+                vx: (dir*100)+(Math.random()*80-40), vy: -40-Math.random()*60,
+                r: 2+Math.random()*3, color:'rgba(120,255,170,0.95)', life:0.35, maxLife:0.35
+              });
+            }
+          }
+        }
+
+        // 失去視線→回 Wander
+        const canSee = hasLineOfSight(ex,ey, px,py, W) && dist < T*12;
+        if(!canSee) e._state='wander';
+      }
+
+      // ---- Merge Seek（血低於 30%：找隊友合體；編輯/遊玩都可）----
+      else if(e._state==='merge_seek'){
+        // 朝最近的「也低血且未死亡」史萊姆移動；距離夠近就吸收
+        let nearest=null, nd=1e9;
+        forEachSlimeNear(e, W.T*8, (o,d)=>{
+          if(o._dead) return;
+          const oLow = (o.hp / Math.max(1,o.maxHp)) <= 0.30;
+          if(!oLow) return;
+          if(d<nd){ nd=d; nearest=o; }
+        });
+
+        if(nearest){
+          const ox = nearest.x+nearest.w/2, oy=nearest.y+nearest.h/2;
+          const dx=ox-ex, dy=oy-ey;
+          const spd = SLIME_BASE.stats.spd * 1.1;
+          e.vx += Math.sign(dx) * spd * 0.05;
+          e.vx = Math.max(-spd, Math.min(spd, e.vx));
+          if(e.onGround && Math.abs(dy)>T*0.2) e.vy = - (200 + 20*(e._stack-1));
+          moveWithCollisions(e, dt);
+          e.face = (dx>=0?1:-1);
+
+          if(nd < Math.max(18, Math.min(e.w,e.h)*0.6)){
+            // 決定誰是「領隊」：hp 比較高者當領隊；若相同就 id 小（引用位址）者
+            const leader = (e.hp>=nearest.hp) ? e : nearest;
+            const target = (leader===e) ? nearest : e;
+            absorb(leader, target);
+            // 被吸收的 target 已標記死亡；領隊若是 e，保持 merge_seek 看有無更多
+            if(leader!==e){ e._state='wander'; }
+          }
+        }else{
+          // 找不到可合體目標 → 逐步回到 wander
+          e._mergeIdle = (e._mergeIdle||0) + dt;
+          if(e._mergeIdle>1.0){ e._mergeIdle=0; e._state='wander'; }
+          moveWithCollisions(e, dt);
+        }
+      }
+
+      // --- 受擊盒（DD_HITBOX） ---
+      if (!e._hb && window.DD_HITBOX){
+        e._hb = DD_HITBOX.track(e, {
+          team: 'enemy',
+          getBounds: ()=>({ x:e.x, y:e.y, w:e.w, h:e.h }),
+          getHP: ()=> e.hp,
+          setHP: v => { e.hp = v; },
+          iframes: 0.10,
+          knock: { force: 300 },
+          getVel: ()=>({ vx:e.vx||0, vy:e.vy||0 }),
+          setVel: (vx,vy)=>{ e.vx=vx; e.vy=vy; },
+          onHit:   (en)=>{ en._flash = 8; en._anim && (en._anim.name='hit', en._anim.i=0); },
+          onDeath: (en)=>{
+            const cx = en.x + en.w/2, cy = en.y + en.h/2;
+            dropLootAt(cx, cy);
+            try{
+              if(window.SKIN && SKIN.spawnFx){
+                SKIN.spawnFx({ x:cx, y:cy, r:18+4*(en._stack-1), vx:0, vy:-50, color:'rgba(120,255,170,0.95)', life:0.30, maxLife:0.30 });
+                SKIN.spawnFx({ x:cx, y:cy, r:12+3*(en._stack-1), vx:0, vy:0,  color:'rgba(40,120,80,0.85)',  life:0.22, maxLife:0.22 });
+              }
+            }catch{}
+            en._dead = true; en._dieAt = performance.now()/1000;
+          }
+        });
+      }
+
+      // --- 視覺：spritesheet 或佔位綠膠 ---
+      const drawer = SKIN && SKIN.ent && SKIN.ent.get && SKIN.ent.get('slime');
+      if (typeof drawer === 'function'){
+        try{ drawer(ctx, e, now, window.THEME); return; }catch{}
+      }
+      drawGreenBlob(ctx, e, now);
+    }
+  };
+
+  /* ========== 皮膚註冊：先掛佔位，Palette 能看見「史萊姆」 ========== */
+  if (SKIN && SKIN.useEnt && (!SKIN.ent.get || !SKIN.ent.get('slime'))){
+    SKIN.useEnt('slime', drawGreenBlob);
+  }
+
+  /* ========== Palette 刷新（若怪物分頁已開） ========== */
+  const monsBtn = document.querySelector('#palette .pill[data-cat="monsters"]');
+  if (monsBtn && monsBtn.classList.contains('active')) monsBtn.click();
+
+})();
+</script>
+<!-- ============ /Plugin: 史萊姆 ============ -->
+
+//怪獸插件結束
+
+
+//動物插件開始
+
+<!-- ============ Plugin: 棕熊（最簡版，可放置；出現在「動物」分類） ============ -->
+<script>
+(()=>{'use strict';
+
+  // 基本命名空間
+  const ENT  = window.ENT  || (window.ENT = {});
+  const SKIN = window.SKIN || (window.SKIN = { ent:{ get:()=>null }, useEnt:()=>{} });
+
+  // 取得格子尺寸（失敗則用 48）
+  function getTileSize(){
+    try{
+      const W = window.world || window.__WORLD;
+      if (W && (W.tileSize||W.T)) return (W.tileSize||W.T);
+      const raw = localStorage.getItem('dd_skel_phase1')||'';
+      const d = JSON.parse(raw||'{}');
+      return d.tileSize || d.T || 48;
+    }catch{ return 48; }
+  }
+
+  // 佔位畫法（就算沒有素材也能看到）
+  function drawBear(ctx, e, t){
+    const cx=e.x+e.w/2, cy=e.y+e.h/2 + Math.sin((t||performance.now()/1000)*2)*1.0;
+    // 影子
+    ctx.save(); ctx.fillStyle='rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.ellipse(e.x+e.w/2, e.y+e.h, Math.min(e.w,e.h)*0.48, Math.min(e.w,e.h)*0.18, 0,0,Math.PI*2); ctx.fill(); ctx.restore();
+    // 身體/頭
+    ctx.save(); ctx.translate(cx,cy); ctx.scale(e.face>=0?1:-1,1);
+    const bw=e.w*0.9, bh=e.h*0.6;
+    const g=ctx.createLinearGradient(0,-bh/2,0,bh/2); g.addColorStop(0,'#6a432f'); g.addColorStop(1,'#3b251b');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.ellipse(0,0,bw/2,bh/2,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(bw*0.22,-bh*0.35,bw*0.23,bh*0.19,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#2a1a14';
+    for(const dx of [-1,1]){ ctx.beginPath(); ctx.ellipse(bw*0.22+dx*bw*0.10,-bh*0.52,bw*0.07,bh*0.07,0,0,Math.PI*2); ctx.fill(); }
+    ctx.fillStyle='#22150f'; ctx.beginPath(); ctx.ellipse(bw*0.27,-bh*0.32,bw*0.08,bh*0.06,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#120b08'; ctx.beginPath(); ctx.arc(bw*0.24,-bh*0.36,2.4,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  if (SKIN && SKIN.useEnt && (!SKIN.ent.get || !SKIN.ent.get('bear'))) {
+    SKIN.useEnt('bear', drawBear);
+  }
+
+  // ★ 最簡版熊（只有 spawn + render，確保能放上地圖）
+  ENT.bear = {
+    label: '棕熊',
+    kind:  'animal',     // 分類用
+    ai:    'bear',
+
+    spawn(opts={}){
+      const T = getTileSize();
+      const w = Math.max(40, Math.floor((opts.sizeTiles?.w||2)   * T * 0.74));
+      const h = Math.max(36, Math.floor((opts.sizeTiles?.h||1.4) * T * 0.68));
+      return {
+        x: opts.x||0, y: opts.y||0, w, h,
+        vx:0, vy:0, face:1, _phase: Math.random()*Math.PI*2
+      };
+    },
+
+    render(ctx,e){
+      // 確保有尺寸（防其他流程漏設）
+      if(!e.w || !e.h){
+        const T=getTileSize();
+        e.w=Math.max(40, Math.floor(2*T*0.74));
+        e.h=Math.max(36, Math.floor(1.4*T*0.68));
+      }
+      // 簡單左右晃動（可刪）
+      const now=performance.now()/1000;
+      e._dir = e._dir ?? (Math.random()<0.5?-1:1);
+      e._span = e._span ?? getTileSize()*3;
+      e._spawn = e._spawn || { x:e.x, y:e.y };
+      const targetX = e._spawn.x + e._dir*e._span;
+      const dir = Math.sign(targetX - e.x) || e._dir;
+      e.x += dir * 60 * Math.min(0.033, (now-(e._last||now)));
+      e.face = dir>=0 ? 1 : -1;
+      if (Math.abs(e.x - targetX) < 6) e._dir *= -1;
+      e._last = now;
+
+      // 畫圖（佔位）
+      (SKIN.ent.get?.('bear') || drawBear)(ctx, e, now);
+    }
+  };
+
+  // 取放置座標（滑鼠位置 → 視窗中心 → 0,0）
+  function getSpawnXY(){
+    const c = window.__cursor || window.editorCursor;
+    if (c && typeof c.x==='number' && typeof c.y==='number') return {x:c.x, y:c.y};
+    const T = getTileSize();
+    const vx = window.scrollX||0, vy = window.scrollY||0;
+    const cx = vx + (innerWidth>>1), cy = vy + (innerHeight>>1);
+    return { x: Math.floor(cx/T)*T, y: Math.floor(cy/T)*T };
+  }
+
+  // 將「棕熊」加入 Palette 的「動物」分頁，按下即可放置
+  function injectAnimalsPalette(){
+    const root = document.querySelector('#palette');
+    if (!root) return false;
+
+    // 找到「動物」分頁容器（常見 class 名稱都試）
+    let list = root.querySelector('.grid[data-cat="animals"], .list[data-cat="animals"], .panel[data-cat="animals"]');
+    if (!list) list = root.querySelector('.grid, .list, .panel'); // 後備：任何清單
+
+    if (!list) return false;
+    if (root.querySelector('[data-key="bear"]')) return true; // 已存在
+
+    const btn = document.createElement('button');
+    btn.className = 'tile ent';
+    btn.dataset.key = 'bear';
+    btn.dataset.cat = 'animals';
+    btn.type = 'button';
+    btn.title = '棕熊';
+    btn.textContent = '棕熊';
+
+    btn.addEventListener('click', () => {
+      try{
+        const pos = getSpawnXY();
+        if (typeof window.__spawn === 'function' && ENT?.bear?.spawn){
+          window.__spawn(() => ENT.bear.spawn({ x:pos.x, y:pos.y }));
+        } else {
+          const e = ENT.bear.spawn({ x:pos.x, y:pos.y });
+          (window.__entities ||= []).push(e);
+        }
+      }catch(err){ console.warn('spawn bear failed', err); }
+    });
+
+    list.appendChild(btn);
+    return true;
+  }
+
+  // 嘗試注入一次；之後監聽 DOM 變化再補一次
+  setTimeout(injectAnimalsPalette, 80);
+  new MutationObserver(() => { injectAnimalsPalette(); })
+    .observe(document.documentElement, { subtree:true, childList:true });
+
+  // 若「動物」分頁正在開啟，點一下刷新
+  const aniBtn = document.querySelector('#palette .pill[data-cat="animals"]');
+  if (aniBtn && aniBtn.classList.contains('active')) aniBtn.click();
+
+})();</script>
+<!-- ============ /Plugin: 棕熊（最簡版） ============ -->
+
+
+
+
+
+<!-- =========================
+     插件：倉鼠（野生↔寵物）
+     - 調色盤新增「倉鼠」（分類：動物/critters）
+     - 野生：地上閒逛、遇牆會掉頭、遇小坑會試跳
+     - 餵食：靠近按 F，消耗 INVENTORY.meat x1 → 馴服成寵物
+     - 寵物：跟隨玩家、遇障礙會跳，太遠會瞬移回來
+========================= -->
+<script>
+(()=>{
+  'use strict';
+
+  const ENT = window.ENT || (window.ENT = {});
+  const SKIN = window.SKIN;
+
+  /* -------- 讀取世界（供碰撞查詢） -------- */
+  const SAVEK = 'dd_skel_phase1';
+  let _rawCache=null, _world=null, _lastSnap=0;
+  function loadWorldSnapshot(force=false){
+    const now = performance.now();
+    if(!force && now - _lastSnap < 450) return _world;
+    const raw = localStorage.getItem(SAVEK)||'';
+    if(!force && raw===_rawCache) return _world;
+    _rawCache = raw; _lastSnap=now;
+    try{
+      const d = JSON.parse(raw||'{}');
+      const tiles = (d.tileRows||[]).map(r=>r.split(''));
+      const T = d.tileSize || 48;
+      _world = {
+        w:d.w||40, h:d.h||24, T, tiles,
+        tileAt(gx,gy){
+          if(gx<0||gy<0||gx>=this.w||gy>=this.h) return '#';
+          const row=this.tiles[gy]||[]; return row[gx]||'.';
+        },
+        isSolidRect(rx,ry,rw,rh){
+          const T=this.T;
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+            if(this.tileAt(x,y)==='#') return true;
+          }
+          return false;
+        }
+      };
+    }catch{
+      _world={w:40,h:24,T:48,tiles:[],tileAt(){return '.';},isSolidRect(){return false;}};
+    }
+    return _world;
+  }
+
+  function moveWithCollisions(o, dt){
+    const W = loadWorldSnapshot(); if(!W) return;
+    // 水平
+    let nx = o.x + o.vx*dt;
+    if(!W.isSolidRect(nx, o.y, o.w, o.h)){ o.x=nx; }
+    else{ const dir=Math.sign(o.vx)||1; let px=o.x; while(!W.isSolidRect(px+dir,o.y,o.w,o.h)) px+=dir; o.x=px; o.vx=0; }
+    // 垂直
+    let ny = o.y + o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x, ny, o.w, o.h)){ o.y=ny; }
+    else{ const dir=Math.sign(o.vy)||1; let py=o.y; while(!W.isSolidRect(o.x,py+dir,o.w,o.h)) py+=dir; o.y=py; if(dir>0) o.onGround=true; o.vy=0; }
+    // 邊界
+    const maxX = W.w*W.T - o.w, maxY = W.h*W.T - o.h;
+    o.x=Math.max(0,Math.min(maxX,o.x)); o.y=Math.max(0,Math.min(maxY,o.y));
+  }
+
+  /* -------- 小工具：簡易通知（用 Phase3 的 toastBox 若存在） -------- */
+  function notify(msg){
+    const box = document.getElementById('toastBox');
+    if(!box){ alert(msg); return; }
+    box.textContent = msg;
+    box.style.background = '#000b'; box.style.padding='8px 12px'; box.style.borderRadius='8px';
+    clearTimeout(notify._t); notify._t = setTimeout(()=>{ box.textContent=''; box.style.padding='0'; }, 1200);
+  }
+
+  /* -------- 按 F 餵食：設旗標，讓倉鼠 render 讀 -------- */
+  let _feedKeyDown = false;
+  addEventListener('keydown', (e)=>{
+    if(e.code==='KeyF' && typeof window.__getMode==='function' && window.__getMode()==='play'){
+      _feedKeyDown = true;
+    }
+  });
+  addEventListener('keyup', (e)=>{ if(e.code==='KeyF') _feedKeyDown=false; });
+
+  /* -------- 倉鼠定義 -------- */
+  const BASE = {
+    label:'倉鼠',
+    kind:'critter',          // 放在「動物」分類
+    ai:'hamster',
+    stats:{
+      spd: 180,              // 地面跑速
+      jump: 520,             // 小跳力
+      grav: 2000,            // 重力
+      petFollow: 220,        // 寵物跟隨基礎速
+      petJump:  560,         // 寵物跳力
+      maxGap:   20           // 跨越坑洞的偵測像素（約半格）
+    }
+  };
+
+  ENT.hamster = {
+    label: BASE.label,
+    kind:  BASE.kind,
+    ai:    BASE.ai,
+    stats: { ...BASE.stats },
+
+    render(ctx, e){
+      const W = loadWorldSnapshot(); const T=W.T;
+      // 初始化尺寸/狀態
+      if(!e._init){
+        e.w = Math.max(22, Math.floor(T*0.46));
+        e.h = Math.max(18, Math.floor(T*0.36));
+        e.vx = e.vx||0; e.vy=e.vy||0; e.face=e.face||1;
+        e.mode = e.mode || 'wild'; // 'wild' | 'pet'
+        e._think = 0;
+        e._init = true;
+      }
+
+      const now = performance.now()/1000;
+      const dt  = Math.min(0.033, e._last ? now - e._last : 0); e._last = now;
+
+      // 共同：重力
+      e.vy += (BASE.stats.grav) * dt;
+      if (e.vy > 1800) e.vy = 1800;
+
+      // 取得玩家（跟隨/餵食要用）
+      const player = (typeof window.__ensurePlayer==='function') ? window.__ensurePlayer() : null;
+
+      if(e.mode==='wild'){
+        // ---- 野生：簡單巡遊 ----
+        // 週期性決策：左右走、停
+        e._think -= dt;
+        if(e._think <= 0){
+          e._think = 0.8 + Math.random()*1.2;
+          const r = Math.random();
+          if(r < 0.6){ e.vx = (Math.random()<0.5 ? -1 : 1) * BASE.stats.spd; e.face = Math.sign(e.vx)||1; }
+          else        { e.vx = 0; }
+        }
+
+        // 牆／小台階：貼邊時給個小跳
+        const ahead = e.face>=0 ? e.x+e.w+1 : e.x-1;
+        const stepProbeY = e.y + e.h - 2;
+        const hitWall = W.isSolidRect(ahead, e.y, 2, e.h-4);
+        if(hitWall && e.onGround){ e.vy = -BASE.stats.jump; }
+
+        // 坑洞：前方下緣探測，快掉下去就小跳
+        const gapProbeX = e.face>=0 ? e.x + e.w + BASE.stats.maxGap : e.x - BASE.stats.maxGap;
+        const gap = !W.isSolidRect(gapProbeX, e.y + e.h + 1, 6, 6);
+        if(gap && e.onGround){ e.vy = -BASE.stats.jump * 0.9; }
+
+        // --- 嘗試被餵食（靠近 + 按 F + 有肉） ---
+        if(player && _feedKeyDown){
+          const px = player.x + player.w/2, py = player.y + player.h/2;
+          const hx = e.x + e.w/2, hy = e.y + e.h/2;
+          const dist = Math.hypot(px-hx, py-hy);
+          if(dist < Math.max(42, T*0.9)){
+            const inv = window.INVENTORY || (window.INVENTORY = {meat:0,loot:0,coins:0});
+            if((inv.meat|0) > 0){
+              inv.meat--;    // 消耗肉
+              // 登記到玩家寵物清單
+              const GEAR = window.GEAR || (window.GEAR = { slots:{}, stash:[], weapons:[], pets:[] });
+              (GEAR.pets || (GEAR.pets=[])).push({ type:'hamster', name:'倉鼠' });
+              if(typeof window.saveGear==='function') window.saveGear();
+
+              // 切換模式 → 寵物
+              e.mode='pet';
+              // 給一小段愛心 FX（用 Phase4 FX 如果有）
+              if(window.SKIN && SKIN.spawnFx){
+                SKIN.spawnFx({ x:hx, y:hy-10, vx:0, vy:-20, r:4, color:'#ff90b3', life:0.6, maxLife:0.6 });
+                SKIN.spawnFx({ x:hx-8, y:hy-16, vx:-15, vy:-30, r:3, color:'#ffd1e0', life:0.6, maxLife:0.6 });
+                SKIN.spawnFx({ x:hx+8, y:hy-16, vx: 15, vy:-30, r:3, color:'#ffd1e0', life:0.6, maxLife:0.6 });
+              }
+              notify('🐹 成為你的寵物了！( -1 🍖 )');
+              _feedKeyDown = false; // 本次處理完
+            }else{
+              notify('需要 🍖 腐肉 才能餵食');
+              _feedKeyDown = false;
+            }
+          }
+        }
+
+      }else{
+        // ---- 寵物：跟隨玩家 ----
+        if(player){
+          const tx = player.x + (player.w/2) - (e.w/2) - 28 * player.face; // 稍微在玩家後側
+          const ty = player.y + player.h - e.h;
+
+          // X 向追隨
+          const dx = tx - e.x;
+          const followV = BASE.stats.petFollow * (1.1 - 0.3*Math.cos(now*6)); // 微呼吸
+          e.vx = Math.sign(dx) * followV;
+          e.face = dx >= 0 ? 1 : -1;
+
+          // 若前方有牆且在地 → 跳一下
+          const ahead = e.face>=0 ? e.x+e.w+1 : e.x-1;
+          const hitWall = W.isSolidRect(ahead, e.y, 2, e.h-4);
+          if(hitWall && e.onGround){ e.vy = -BASE.stats.petJump; }
+
+          // 若要跟的點在上方很多 → 試著跳
+          if(ty < e.y - 6 && e.onGround){ e.vy = -BASE.stats.petJump; }
+
+          // 坑洞保護（寵物盡量不掉坑）
+          const gapProbeX = e.face>=0 ? e.x + e.w + BASE.stats.maxGap : e.x - BASE.stats.maxGap;
+          const gap = !W.isSolidRect(gapProbeX, e.y + e.h + 1, 6, 6);
+          if(gap && e.onGround){ e.vy = -BASE.stats.petJump * 0.9; }
+
+          // 距離過遠 → 瞬移到玩家附近
+          const hx = e.x + e.w/2, hy = e.y + e.h/2;
+          const px = player.x + player.w/2, py = player.y + player.h/2;
+          if(Math.hypot(px-hx, py-hy) > Math.max(380, T*8)){
+            e.x = player.x + (player.face>0 ? -T*0.6 : T*0.6);
+            e.y = player.y - 4; e.vx=0; e.vy=0;
+          }
+        }else{
+          // 沒玩家就待機
+          e.vx *= 0.9;
+        }
+      }
+
+      // 物理解算
+      moveWithCollisions(e, dt);
+
+      // --- 視覺：若 Phase4 有皮膚就用，否則簡單畫 ---
+      const useSkin = SKIN && SKIN.ent && SKIN.ent.get && SKIN.ent.get('hamster');
+      if(typeof useSkin === 'function'){
+        try{ useSkin(ctx, e, now, window.THEME); return; }catch{}
+      }
+
+      // 備援小圓團（野生=棕色，寵物=亮粉）
+      ctx.save();
+      ctx.translate(e.x + e.w/2, e.y + e.h/2);
+      ctx.fillStyle = (e.mode==='pet' ? '#ff90b3' : '#d9a074');
+      ctx.beginPath();
+      ctx.arc(0,0, Math.min(e.w,e.h)*0.48, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  };
+
+  // 若你已載入 Phase4 的範例皮膚，幫你掛倉鼠皮
+  if(SKIN && SKIN.useEnt && !SKIN.ent.get('hamster') && typeof window.drawHamster==='function'){
+    SKIN.useEnt('hamster', window.drawHamster);
+  }
+
+  // 調色盤會自動把 ENT.kind==='critter' 的項目放到「動物」分類；
+  // 如果你此時已經開著「動物」那頁，幫你刷新一次
+  const critBtn = document.querySelector('#palette .pill[data-cat="critters"]');
+  if (critBtn && critBtn.classList.contains('active')) critBtn.click();
+
+})();
+</script>
+//倉鼠插件結束
+
+//動物插件結束
+
+
+<!-- 插入：武器外觀管理（全域 WEAPON） -->
+<script>
+(() => {
+  'use strict';
+  // 嘗試抓 tileSize（用來做比例）
+  let T = 48;
+  try{ const d=JSON.parse(localStorage.getItem('dd_skel_phase1')||'{}'); T = d.tileSize||48; }catch{}
+
+  const SKINS = {
+    wood: {         // 木刀（棕色）
+      id:'wood',
+      blade:'#a8744f', edge:'#f2e6d2', trail:'rgba(168,116,79,0.35)',
+      len: T*0.95, width: T*0.18
+    },
+    iron: {         // 鐵劍（冷灰）
+      id:'iron',
+      blade:'#cfd4da', edge:'#ffffff', trail:'rgba(200,220,255,0.35)',
+      len: T*1.05, width: T*0.16
+    },
+    steel: {        // 鋼劍（深灰）
+      id:'steel',
+      blade:'#b0b6bf', edge:'#f7f7f7', trail:'rgba(190,210,255,0.32)',
+      len: T*1.08, width: T*0.17
+    }
+  };
+
+  const WEAPON = {
+    _id: 'wood',
+    set(id){ this._id = SKINS[id] ? id : 'wood'; },
+    get(){ return SKINS[this._id] || SKINS.wood; },
+    skins: SKINS
+  };
+
+  window.WEAPON = WEAPON;
+  // 你可以隨時切換：WEAPON.set('wood') / WEAPON.set('iron') / WEAPON.set('steel')
+})();
+</script>
+
+
+<!-- =========================
+ A) 外掛：DD_HITBOX（通用受擊/扣血系統）
+ - 讓任何「攻擊事件」→ 自動對已註冊的實體扣血 / 擊退 / 觸發死亡
+========================= -->
+<script>
+(() => {
+  'use strict';
+
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+  function center(b){ return { cx:b.x+b.w/2, cy:b.y+b.h/2 }; }
+
+  function circleHitsAABB(cx,cy,r, box){
+    const nx = clamp(cx, box.x, box.x+box.w);
+    const ny = clamp(cy, box.y, box.y+box.h);
+    const dx = cx - nx, dy = cy - ny;
+    return dx*dx + dy*dy <= r*r;
+  }
+  function sectorHitsAABB(cx,cy, r, dir, spread, box){
+    const c = center(box);
+    const vx = c.cx - cx, vy = c.cy - cy;
+    const d2 = vx*vx + vy*vy; if(d2>r*r) return false;
+    const len = Math.hypot(vx,vy)||1;
+    const dot = (vx/len)*dir[0] + (vy/len)*dir[1];
+    return dot >= Math.cos(spread*0.5);
+  }
+
+  const regs = new Set(); // { e, team, getBounds, getHP, setHP, iframes, _cd, knock, getVel, setVel, onHit, onDeath }
+
+  function track(entity, opts={}){
+    const r = {
+      e: entity,
+      team: opts.team || 'enemy',
+      getBounds: opts.getBounds || (()=>({x:entity.x,y:entity.y,w:entity.w,h:entity.h})),
+      getHP: opts.getHP || (()=> (opts.hpRef ? +opts.hpRef[opts.hpKey] : +entity.hp)),
+      setHP: opts.setHP || (v=>{ if(opts.hpRef) opts.hpRef[opts.hpKey]=v; else entity.hp=v; }),
+      iframes: Math.max(0, opts.iframes ?? 0.12),
+      _cd: 0,
+      knock: opts.knock || null,
+      getVel: opts.getVel || (()=>({vx:entity.vx||0, vy:entity.vy||0})),
+      setVel: opts.setVel || ((vx,vy)=>{ entity.vx=vx; entity.vy=vy; }),
+      onHit:   typeof opts.onHit==='function'? opts.onHit : null,
+      onDeath: typeof opts.onDeath==='function'?opts.onDeath: null
+    };
+    regs.add(r);
+    return r;
+  }
+  function untrack(entity){ for(const r of regs){ if(r.e===entity){ regs.delete(r); break; } } }
+
+  (function coolLoop(){
+    for(const r of regs){ if(r._cd>0) r._cd=Math.max(0, r._cd-1/60); }
+    requestAnimationFrame(coolLoop);
+  })();
+
+  window.addEventListener('dd:attack', (ev)=>{
+    const a = ev.detail || {};
+    const atkTeam = a.team || 'player';
+    const dmg = Math.max(0, +a.atk||0);
+    if(!dmg) return;
+
+    for(const r of regs){
+      if(r.team===atkTeam) continue;
+      if(r._cd>0) continue;
+
+      const box = r.getBounds();
+      let hit=false;
+      if(a.shape==='circle') hit = circleHitsAABB(a.cx,a.cy,+a.r||0, box);
+      else if(a.shape==='sector') hit = sectorHitsAABB(a.cx,a.cy,+a.r||0, a.dir||[1,0], +a.spread||0, box);
+      else if(a.shape==='point') hit = circleHitsAABB(a.cx,a.cy,1, box);
+      if(!hit) continue;
+
+      const hp0 = r.getHP();
+      const hp1 = Math.max(0, hp0 - dmg);
+      r.setHP(hp1);
+      r._cd = r.iframes;
+
+      if(r.knock && a.dir){
+        const k = +r.knock.force||0;
+        if(k){
+          const v = r.getVel();
+          r.setVel((v.vx||0)+a.dir[0]*k, (v.vy||0)+a.dir[1]*(-0.2*k)-0.35*k);
+        }
+      }
+
+      const info = { dmg, hp0, hp1, atk:a, bounds:box };
+      if(r.onHit)   try{ r.onHit(r.e, info); }catch{}
+      if(hp1<=0 && r.onDeath) try{ r.onDeath(r.e, info); }catch{}
+
+      try{
+        if(window.SKIN && SKIN.spawnFx){
+          const c = center(box);
+          SKIN.spawnFx({ x:c.cx, y:c.cy-8, r:10, vx:0, vy:-30, color:'rgba(255,90,90,0.85)', life:0.18, maxLife:0.18 });
+        }
+      }catch{}
+    }
+  });
+
+  window.DD_HITBOX = { track, untrack };
+})();
+</script>
+
+
+
+
+
+
+
+//人物插件開始
+
+
+<!-- 插件：人物「妤琦」— 吹笛觸發歌聲領域（持續暈眩+小傷）；喜動物；可收服 -->
+<script>
+(()=>{ 'use strict';
+
+  const ENT   = window.ENT  || (window.ENT={});
+  const SKIN  = window.SKIN;
+  const GEAR  = window.GEAR || (window.GEAR={ slots:{}, stash:[], weapons:[], pets:[] });
+
+  /* ===== 世界快照（供比例/碰撞） ===== */
+  const SAVEK='dd_skel_phase1';
+  let _rawCache=null,_world=null,_lastSnap=0;
+  function loadWorldSnapshot(force=false){
+    const now=performance.now();
+    if(!force && now-_lastSnap<450) return _world;
+    const raw=localStorage.getItem(SAVEK)||'';
+    if(!force && raw===_rawCache) return _world;
+    _rawCache=raw; _lastSnap=now;
+    try{
+      const d=JSON.parse(raw||'{}');
+      const T=d.tileSize||48;
+      const tiles=(d.tileRows||[]).map(r=>r.split(''));
+      _world={
+        w:d.w||40, h:d.h||24, T, tiles,
+        isSolidRect(rx,ry,rw,rh){
+          const x0=Math.floor(rx/T), x1=Math.floor((rx+rw-1)/T);
+          const y0=Math.floor(ry/T), y1=Math.floor((ry+rh-1)/T);
+          for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+            if(y<0||x<0||x>=this.w||y>=this.h) return true;
+            if((this.tiles[y]||[])[x]==='#') return true;
+          }
+          return false;
+        }
+      };
+    }catch{ _world={w:40,h:24,T:48,tiles:[],isSolidRect(){return false;}}; }
+    return _world;
+  }
+  function moveWithCollisions(o,dt){
+    const W=loadWorldSnapshot(); if(!W) return;
+    // 水平
+    let nx=o.x+o.vx*dt;
+    if(!W.isSolidRect(nx,o.y,o.w,o.h)) o.x=nx;
+    else{ const dir=Math.sign(o.vx)||1; let px=o.x; while(!W.isSolidRect(px+dir,o.y,o.w,o.h)) px+=dir; o.x=px; o.vx=0; }
+    // 垂直
+    let ny=o.y+o.vy*dt; o.onGround=false;
+    if(!W.isSolidRect(o.x,ny,o.w,o.h)) o.y=ny;
+    else{ const dir=Math.sign(o.vy)||1; let py=o.y; while(!W.isSolidRect(o.x,py+dir,o.w,o.h)) py+=dir; o.y=py; if(dir>0) o.onGround=true; o.vy=0; }
+  }
+
+  /* ===== 參數 ===== */
+  const CFG={
+    hp:120,
+    grav:2200,
+    // 歌聲領域（吹笛觸發）
+    meters:10,               // 半徑：10 公尺（≈ 10 格）
+    auraDur:3.5,             // 領域持續秒數
+    tick:0.35,               // 傷害/暈眩的觸發間隔
+    dmgPerTick:2,            // 每跳傷害
+    stunSec:0.8,             // 每跳暈眩秒數（怪 AI 需自行讀取 dd:status）
+    singChance:0.6,          // 吹笛時觸發機率
+    minSingInterval:0.9,     // 最短間隔（避免連發）
+    // AI
+    likeCritterRangeTiles:30,
+    walkSpd:150,
+    jump:680,
+    wallProbeTiles:2,
+    wallJumpChance:0.55,
+    tameOverlapSec:3.0       // 與動物重疊滿 3 秒 → 有機率收服
+  };
+
+  /* ===== 動物 ping 收集：{id,x,y,w,h,ts} ===== */
+  const critters=new Map(); // key -> last sight
+  let _pingId=0;
+  window.addEventListener('ent:ping',(ev)=>{
+    const d=ev.detail||{};
+    if(d.kind!=='critter') return;
+    const id = d.id || (d.type+':' + (++_pingId));
+    critters.set(id,{id,x:d.x,y:d.y,w:d.w||28,h:d.h||28,ts:performance.now()});
+    // 清過舊
+    const now=performance.now();
+    for(const [k,v] of critters){ if(now - v.ts > 900) critters.delete(k); }
+  });
+
+  /* ===== 自動替動物外掛包一層 ping ===== */
+  function wrapPing(type){
+    const ENT = window.ENT || {};
+    const def=ENT[type]; if(!def || typeof def.render!=='function' || def.__pingWrapped) return;
+    const orig=def.render;
+    def.render=function(ctx,e){
+      window.dispatchEvent(new CustomEvent('ent:ping',{detail:{
+        id:e.__id||(e.__id=(type+'-'+Math.random().toString(36).slice(2))),
+        type, kind:'critter', x:e.x, y:e.y, w:e.w, h:e.h
+      }}));
+      return orig.call(this,ctx,e);
+    };
+    def.__pingWrapped=true;
+  }
+  wrapPing('hamster'); wrapPing('squirrel'); // 有就包起來；沒有就忽略
+
+  /* ===== 吹笛事件（KeyL 或 dd:flute） ===== */
+  const fluteQueue=[];
+  function onFlute(){ fluteQueue.push(performance.now()); }
+  addEventListener('keydown',(e)=>{ if(e.code==='KeyL') onFlute(); });
+  window.addEventListener('dd:flute', onFlute);
+
+  /* ===== 歌聲領域管理（每個妤琦各自持有） ===== */
+  function makeAura(cx,cy,r){
+    return { cx,cy,r, left:CFG.auraDur, tick:0 };
+  }
+  function tickAura(e,dt,ctx){
+    if(!e._auras || !e._auras.length) return;
+    for(let i=e._auras.length-1;i>=0;i--){
+      const a=e._auras[i];
+      a.left -= dt; a.tick -= dt;
+      if(a.tick<=0){
+        a.tick += CFG.tick;
+        // 小傷害
+        window.dispatchEvent(new CustomEvent('dd:attack',{
+          detail:{ shape:'circle', cx:a.cx, cy:a.cy, r:a.r, atk:CFG.dmgPerTick, team:'player', dir:[1,0], meta:{kind:'song-dot'} }
+        }));
+        // 暈眩：廣播狀態事件（怪物 AI 若有監聽就能吃到）
+        window.dispatchEvent(new CustomEvent('dd:status',{
+          detail:{ shape:'circle', cx:a.cx, cy:a.cy, r:a.r, team:'player', effect:{ stun:CFG.stunSec }, source:'yuqi-song' }
+        }));
+      }
+      // 視覺（柔和音圈）
+      if(ctx){
+        const p = Math.max(0, a.left/CFG.auraDur);
+        ctx.save();
+        ctx.globalAlpha = 0.18 + 0.22*p;
+        const g = ctx.createRadialGradient(a.cx,a.cy, a.r*0.15, a.cx,a.cy, a.r);
+        g.addColorStop(0,'rgba(255,190,255,0.8)');
+        g.addColorStop(1,'rgba(255,190,255,0.0)');
+        ctx.fillStyle=g;
+        ctx.beginPath(); ctx.arc(a.cx,a.cy,a.r,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+      if(a.left<=0) e._auras.splice(i,1);
+    }
+  }
+
+  /* ===== 妤琦定義 ===== */
+  ENT.yuqi={
+    label:'妤琦（歌手）',
+    kind:'character',
+    ai:'singer2',
+    stats:{ hp:CFG.hp },
+
+    render(ctx,e){
+      const W=loadWorldSnapshot(); const T=W.T;
+      const PX_PER_M=T;
+
+      // 初始化
+      if(!e._init){
+        e.w=Math.max(28,Math.floor(T*0.60));
+        e.h=Math.max(44,Math.floor(T*1.10));
+        e.vx=0; e.vy=0; e.face=1;
+        e._last=performance.now()/1000;
+        e._goal=null;           // {x,y,ttl}
+        e._tameTarget=null;     // {id,acc}
+        e._lastSingAt=0;
+        e._auras=[];
+        e._init=true;
+      }
+
+      // 時間步
+      const now=performance.now()/1000;
+      const dt = Math.min(0.033, now-(e._last||now)); e._last=now;
+
+      /* ---- AI：目標選擇 ---- */
+      const MAXR = CFG.likeCritterRangeTiles*T;
+      let best=null, cx=e.x+e.w/2, cy=e.y+e.h/2;
+      for(const v of critters.values()){
+        const dx=(v.x+v.w/2)-cx, dy=(v.y+v.h/2)-cy;
+        const d2=dx*dx+dy*dy;
+        if(d2 <= MAXR*MAXR){
+          if(!best || d2<best.d2) best={x:v.x,y:v.y,w:v.w,h:v.h,d2,id:v.id};
+        }
+      }
+      if(best){
+        e._goal = { x:best.x, y:best.y, ttl:1.2 };
+        e._seekCritterId = best.id;
+      }else{
+        if(!e._goal || e._goal.ttl<=0){
+          const dir = (Math.random()<0.5 ? -1 : 1);
+          const roam = dir*(T*(2+Math.random()*4));
+          e._goal={ x:cx+roam, y:cy, ttl: 2.2+Math.random()*1.5 };
+        }else{
+          e._goal.ttl -= dt;
+        }
+      }
+
+      /* ---- 移動 + 簡易跳牆 ---- */
+      const targetX = (e._goal? e._goal.x : cx);
+      const ax = Math.sign(targetX - cx);
+      e.vx = ax * CFG.walkSpd;
+      if(ax) e.face = ax>0 ? 1 : -1;
+
+      const probeX = ax>=0 ? e.x+e.w+1 : e.x-1;
+      const probeW = CFG.wallProbeTiles*T;
+      const hitWall = W.isSolidRect(probeX, e.y, probeW, e.h-4);
+      if(hitWall && e.onGround && Math.random() < CFG.wallJumpChance){
+        e.vy = -CFG.jump;
+      }
+
+      e.vy += CFG.grav*dt; if(e.vy>2000) e.vy=2000;
+      moveWithCollisions(e, dt);
+
+      /* ---- 收服寵物（與動物重疊累積時間） ---- */
+      if(best){
+        const bx=best.x, by=best.y, bw=best.w||28, bh=best.h||28;
+        const overlap = !( (e.x+e.w)<bx || (bx+bw)<e.x || (e.y+e.h)<by || (by+bh)<e.y );
+        if(overlap){
+          if(!e._tameTarget || e._tameTarget.id!==best.id) e._tameTarget={id:best.id, acc:0};
+          e._tameTarget.acc += dt;
+          if(e._tameTarget.acc >= CFG.tameOverlapSec){
+            (GEAR.pets||(GEAR.pets=[])).push({ type:'pet_'+(best.id||'critter'), name:'被收服的小夥伴' });
+            if(window.saveGear) window.saveGear();
+            e._tameTarget=null;
+            if(window.toast) window.toast('🎶 妤琦收服了一隻小動物！');
+          }
+        }else{
+          if(e._tameTarget && e._tameTarget.id===best.id) e._tameTarget.acc=Math.max(0, e._tameTarget.acc-dt*0.6);
+        }
+      }else{
+        e._tameTarget=null;
+      }
+
+      /* ---- 吹笛 → 有機率啟動歌聲領域（DoT + Stun） ---- */
+      if(fluteQueue.length){
+        const _ = fluteQueue.shift(); // 拿一個訊號
+        const tooSoon = (now - e._lastSingAt) < CFG.minSingInterval;
+        if(!tooSoon && Math.random() < CFG.singChance){
+          e._lastSingAt = now;
+          const r  = CFG.meters * PX_PER_M;
+          const ocx = e.x + e.w/2, ocy = e.y + e.h/2;
+          e._auras.push( makeAura(ocx, ocy, r) );
+        }
+      }
+
+      /* ---- 歌聲領域：持續觸發攻擊與暈眩 ---- */
+      tickAura(e, dt, ctx);
+
+      /* ---- 視覺（簡潔粉系歌手） ---- */
+      const t=now; const sway=Math.sin(t*2.2)*3;
+      ctx.save();
+      ctx.translate(e.x+e.w/2, e.y+e.h);
+      ctx.scale(e.face>0?1:-1,1);
+      // 麥克風架
+      ctx.fillStyle='#d16ad3';
+      ctx.fillRect( e.w*0.15, -e.h*0.98, 3, e.h*0.96 );
+      ctx.beginPath(); ctx.arc(e.w*0.15+1.5, -e.h*0.98, 6, 0, Math.PI*2); ctx.fill();
+      // 長髮
+      ctx.fillStyle='#f7b7ff';
+      ctx.beginPath(); ctx.ellipse(-e.w*0.08, -e.h*0.82, e.w*0.22, e.h*0.32, 0, 0, Math.PI*2); ctx.fill();
+      // 禮服
+      const g=ctx.createLinearGradient(0,-e.h*0.9,0,0);
+      g.addColorStop(0,'#ffd8ff'); g.addColorStop(1,'#ffbdf2');
+      ctx.fillStyle=g;
+      ctx.save(); ctx.rotate(sway*0.01);
+      roundRect(ctx, -e.w*0.22, -e.h*0.85, e.w*0.44, e.h*0.78, 8); ctx.fill();
+      ctx.restore();
+      ctx.restore();
+    }
+  };
+
+  function roundRect(ctx,x,y,w,h,r){
+    const rr=Math.min(r,w/2,h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+  }
+
+  /* ===== 可選 UI：右下角加「🎺 吹笛」按鈕 ===== */
+  (function injectFluteBtn(){
+    const controls = document.getElementById('controls');
+    if(!controls) return;
+    let right = controls.querySelector('.cluster.right');
+    if(!right){
+      const d=document.createElement('div');
+      d.className='cluster right';
+      d.style.cssText='position:absolute;right:12px;bottom:12px;display:flex;gap:10px;align-items:flex-end;flex-direction:column';
+      controls.appendChild((right=d));
+    }
+    if(right.querySelector('#btn-flute')) return;
+    const b=document.createElement('div');
+    b.id='btn-flute';
+    b.textContent='🎺';
+    b.style.cssText='width:56px;height:56px;border-radius:999px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:26px;backdrop-filter:blur(4px);pointer-events:auto;user-select:none;';
+    right.prepend(b);
+    const fire=()=>{ window.dispatchEvent(new CustomEvent('dd:flute')); };
+    b.addEventListener('touchstart', (e)=>{ fire(); e.preventDefault(); }, {passive:false});
+    b.addEventListener('mousedown', (e)=>{ fire(); e.preventDefault(); });
+  })();
+
+  // 若此時正停在「人物」分頁，刷新一次列表
+  const charBtn=document.querySelector('#palette .pill[data-cat="characters"]');
+  if(charBtn && charBtn.classList.contains('active')) charBtn.click();
+
+})();</script>
+//妤琦插件結束
+
+//人物插件結束
+
+
+
+//右下角「🥩馴養」按鈕
+<script>
+(()=> {
+  'use strict';
+  function sendKey(code, type){
+    const ev = new KeyboardEvent(type, { code, key: code, bubbles: true });
+    window.dispatchEvent(ev);
+  }
+  function injectTameButton(){
+    const controls = document.getElementById('controls');
+    if(!controls) return;                           // Phase3 會建立
+    const right = controls.querySelector('.cluster.right');
+    if(!right) return;
+    if(document.getElementById('btn-tame')) return; // 已存在就不重複
+
+    const b = document.createElement('div');
+    b.id = 'btn-tame';
+    b.className = 'key';
+    b.textContent = '🥩 馴養';
+    b.title = '用腐肉嘗試馴化附近松鼠';
+    b.style.cssText = 'width:84px;height:40px;border-radius:10px;background:rgba(255,255,255,.12);backdrop-filter:blur(4px);font-weight:900;pointer-events:auto;display:flex;align-items:center;justify-content:center;';
+
+    // 點一下 → 發出 dd:tame，並相容舊 KeyF
+    const fire = (e)=>{
+      window.dispatchEvent(new CustomEvent('dd:tame', { detail:{ source:'button' }}));
+      sendKey('KeyF','keydown'); setTimeout(()=>sendKey('KeyF','keyup'), 20);
+      e.preventDefault();
+    };
+    b.addEventListener('click',  fire);
+    b.addEventListener('touchend', fire, {passive:false});
+
+    right.appendChild(b);
+  }
+
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', injectTameButton);
+  } else {
+    injectTameButton();
+  }
+})();
+</script>
+
+<!-- 外掛：人物分頁渲染（不覆蓋 Phase1；讓「人物」pill 正常工作） -->
+<script>
+(()=> {
+  'use strict';
+
+  const ENT = window.ENT || (window.ENT = {});
+
+  // 1) 若沒有「人物」pill，建立一顆
+  const hdr = document.querySelector('#palette .pal-row.header');
+  if (hdr && !hdr.querySelector('.pill[data-cat="characters"]')) {
+    const btn = document.createElement('button');
+    btn.className = 'pill';
+    btn.setAttribute('data-cat','characters');
+    btn.textContent = '人物';
+    const backBtn = document.getElementById('palBackBtn');
+    hdr.insertBefore(btn, backBtn); // 放在「返回」前
+  }
+
+  // 2) 點擊「人物」→ 直接渲染人物清單到 #palTiles
+  const pal = document.getElementById('palette');
+  const tilesBox = document.getElementById('palTiles');
+  const backBtn  = document.getElementById('palBackBtn');
+
+  function renderCharacters(){
+    // 標記 pill 狀態
+    document.querySelectorAll('#palette .pill[data-cat]').forEach(b=>b.classList.remove('active'));
+    const charBtn = document.querySelector('#palette .pill[data-cat="characters"]');
+    if (charBtn) charBtn.classList.add('active');
+    if (backBtn) backBtn.classList.remove('hidden');
+
+    // 收集 ENT 中 kind==='character' 的項目
+    const items = [];
+    for (const [key, def] of Object.entries(ENT)) {
+      if (def && def.kind === 'character') {
+        items.push({label: def.label || key, val: key});
+      }
+    }
+
+    tilesBox.innerHTML = '';
+    if (items.length === 0) {
+      const div = document.createElement('div');
+      div.className = 'tile';
+      div.textContent = '（尚無人物）';
+      div.style.opacity = .7;
+      tilesBox.appendChild(div);
+      return;
+    }
+
+    // 造出每個可點 tile；data-brush=實體鍵
+    items.forEach(it=>{
+      const div = document.createElement('div');
+      div.className = 'tile';
+      div.setAttribute('data-brush', it.val);
+      div.textContent = it.label;
+      tilesBox.appendChild(div);
+    });
+
+    // 不需要自己處理 brush：你的 Phase1 已有面板的事件代理，
+    // 會讀取 .tile 的 data-brush 並設定畫筆，然後就能放在地圖上了。
+  }
+
+  // 3) 接手「人物」pill 的點擊
+  pal.addEventListener('click', (e)=>{
+    const b = e.target.closest('.pill[data-cat="characters"]');
+    if (b) { renderCharacters(); }
+  });
+
+  // 4) 若載入時「人物」pill已是 active（少見），也刷新一次
+  const initCharActive = document.querySelector('#palette .pill[data-cat="characters"].active');
+  if (initCharActive) renderCharacters();
+
+})();
+</script>
+
+
+
+<!-- ====== 🖐 主按鈕 + 子選單 Script 開始 ====== -->
+<script>
+(()=> {
+  'use strict';
+
+  function sendKey(code, type){
+    const ev = new KeyboardEvent(type, { code, key: code, bubbles: true });
+    window.dispatchEvent(ev);
+  }
+
+  function ensureHandMenu(){
+    const controls = document.getElementById('controls');
+    if(!controls) return;
+
+    let right = controls.querySelector('.cluster.right');
+    if(!right){
+      right = document.createElement('div');
+      right.className='cluster right';
+      right.style.cssText='position:absolute;right:12px;bottom:12px;display:flex;gap:10px;align-items:flex-end;flex-direction:column';
+      controls.appendChild(right);
+    }
+
+    let hand =
+      controls.querySelector('#btn-hand') ||
+      controls.querySelector('[data-action="hand"]') ||
+      Array.from(controls.querySelectorAll('.key,div,button'))
+           .find(el => (el.textContent||'').includes('🖐'));
+
+    if(!hand){
+      hand = document.createElement('div');
+      hand.id = 'btn-hand';
+      hand.className = 'key';
+      hand.textContent = '🖐';
+      hand.title = '互動';
+      hand.style.cssText = 'width:56px;height:56px;border-radius:999px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:26px;backdrop-filter:blur(4px);pointer-events:auto;user-select:none;';
+      right.insertBefore(hand, right.firstChild || null);
+      hand.style.marginBottom = '10px';
+    }
+
+    // 移除舊的 🎺 / 🥩 獨立按鈕
+    ['btn-flute','btn-tame'].forEach(id=>{
+      const old = document.getElementById(id);
+      if(old && old.parentElement) old.parentElement.removeChild(old);
+    });
+
+    if(hand.querySelector('.hand-menu')) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'hand-menu';
+    menu.style.cssText = [
+      'position:absolute',
+      'bottom:64px',
+      'right:0',
+      'display:none',
+      'flex-direction:column',
+      'gap:8px',
+      'padding:10px',
+      'border-radius:12px',
+      'background:rgba(12,14,28,.75)',
+      'border:1px solid rgba(255,255,255,.18)',
+      'backdrop-filter:blur(6px)',
+      'box-shadow:0 8px 26px rgba(0,0,0,.35)',
+      'z-index:9999'
+    ].join(';');
+
+    const btnCss = 'width:40px;height:40px;border-radius:10px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;user-select:none;cursor:pointer;';
+
+    // 🎺 吹笛
+    const bFlute = document.createElement('div');
+    bFlute.className = 'hand-menu-item';
+    bFlute.textContent = '🎺';
+    bFlute.title = '吹笛（派送 dd:flute）';
+    bFlute.style.cssText = btnCss;
+    const fireFlute = ()=>window.dispatchEvent(new CustomEvent('dd:flute'));
+    // ✅ 點擊後不自動收起
+    bFlute.addEventListener('click', (e)=>{ fireFlute(); e.preventDefault(); }, {passive:false});
+    bFlute.addEventListener('touchend', (e)=>{ fireFlute(); e.preventDefault(); }, {passive:false});
+
+    // 🥩 馴養
+    const bTame = document.createElement('div');
+    bTame.className = 'hand-menu-item';
+    bTame.textContent = '🥩';
+    bTame.title = '馴養（派送 dd:tame + KeyF）';
+    bTame.style.cssText = btnCss;
+    const fireTame = ()=>{
+      window.dispatchEvent(new CustomEvent('dd:tame', { detail:{ source:'hand-menu' }}));
+      sendKey('KeyF','keydown'); setTimeout(()=>sendKey('KeyF','keyup'), 20);
+    };
+    // ✅ 點擊後不自動收起
+    bTame.addEventListener('click', (e)=>{ fireTame(); e.preventDefault(); }, {passive:false});
+    bTame.addEventListener('touchend', (e)=>{ fireTame(); e.preventDefault(); }, {passive:false});
+
+    menu.appendChild(bFlute);
+    menu.appendChild(bTame);
+
+    hand.style.position = 'relative';
+    hand.appendChild(menu);
+
+    let open = false;
+    const showMenu = ()=>{ menu.style.display = 'flex'; requestAnimationFrame(()=>{ open = true; }); };
+    const hideMenu = ()=>{ menu.style.display = 'none'; open = false; };
+    const toggleMenu = ()=>{ open ? hideMenu() : showMenu(); };
+
+    // ✅ 只有點🖐主按鈕才會開/關
+    hand.addEventListener('click', (e)=>{
+  if (e.target !== hand) return;   // 只接受點到 🖐本體
+  e.preventDefault();
+  e.stopPropagation();
+  toggleMenu();
+}, {passive:false});
+
+
+    // ✅ 長按只負責「打開」，不會自動關閉
+    hand.addEventListener('touchstart', (e)=>{
+      let held = false;
+      const t = setTimeout(()=>{ held = true; showMenu(); }, 250);
+      const end = ()=>{ clearTimeout(t); hand.removeEventListener('touchend', end); hand.removeEventListener('touchmove', cancel);
+        if(!held) toggleMenu(); // 短按 => 切換
+      };
+      const cancel = ()=>{ clearTimeout(t); };
+      hand.addEventListener('touchend', end, {once:true});
+      hand.addEventListener('touchmove', cancel, {once:true});
+      e.preventDefault();
+    }, {passive:false});
+
+    // ❌ 移除外部點擊與 ESC 自動關閉（改由🖐控制）
+    // document.addEventListener('click', (e)=>{ if(open && !hand.contains(e.target)) hideMenu(); });
+    // window.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') hideMenu(); });
+  }
+
+  function init(){
+    const controls = document.getElementById('controls');
+    if(!controls){
+      const obs = new MutationObserver((muts, ob)=>{
+        if(document.getElementById('controls')){ ensureHandMenu(); ob.disconnect(); }
+      });
+      obs.observe(document.documentElement || document.body, { childList:true, subtree:true });
+      return;
+    }
+    ensureHandMenu();
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  }else{
+    init();
+  }
+})();
+</script>
+<!-- ====== 🖐 主按鈕 + 子選單 Script 結束 ====== -->
+
+<!-- ====== 🖐 覆蓋檔：只用主按鈕開/關，子項目不關選單 ====== -->
+<script>
+(()=> {
+  'use strict';
+
+  function ready(selector, cb){
+    const el = document.querySelector(selector);
+    if (el) return cb(el);
+    const obs = new MutationObserver(()=>{
+      const el2 = document.querySelector(selector);
+      if (el2){ obs.disconnect(); cb(el2); }
+    });
+    obs.observe(document.documentElement||document.body, {childList:true, subtree:true});
+  }
+
+  // 等待 🖐 主按鈕出現
+  ready('#btn-hand', (hand)=>{
+    // 等到子選單出現
+    const ensureMenu = ()=>{
+      const menu = hand.querySelector('.hand-menu');
+      if (!menu) return false;
+
+      // 1) 阻止子選單內的點擊/觸控往上冒泡（避免觸發 hand 的切換）
+      const stop = e => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation?.(); };
+      menu.addEventListener('click', stop, {passive:false});
+      menu.addEventListener('touchstart', stop, {passive:false});
+      menu.addEventListener('touchend', stop, {passive:false});
+
+      // 也幫子按鈕本體加上保險
+      const btns = menu.querySelectorAll('.hand-menu-item, .hand-menu *');
+      btns.forEach(btn=>{
+        btn.addEventListener('click', stop, {passive:false});
+        btn.addEventListener('touchend', stop, {passive:false});
+      });
+
+      // 2) 在捕獲階段攔截 hand 的 click/touch：
+      //    只有「點到 hand 本體」才往後傳到原本的 toggle 監聽；
+      //    點到子孫就直接擋掉，避免觸發收合。
+      const gate = (e)=>{
+        // 只放行點到 hand 本體的事件
+        if (e.target !== hand){
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation?.();
+        }
+      };
+      hand.addEventListener('click', gate, {capture:true, passive:false});
+      hand.addEventListener('touchstart', gate, {capture:true, passive:false});
+
+      // 3) 可選：防止頁面其它區域誤觸造成關閉（若你的原碼有外部點擊關閉）
+      // document.addEventListener('click', (e)=>{
+      //   if (menu.style.display === 'flex' && !hand.contains(e.target)) {
+      //     // 直接吃掉此事件，避免外部關閉
+      //     e.stopPropagation();
+      //     e.stopImmediatePropagation?.();
+      //   }
+      // }, {capture:true});
+
+      return true;
+    };
+
+    if (!ensureMenu()){
+      // 若此刻 hand-menu 還沒加到 DOM，觀察並稍後補上
+      const obs = new MutationObserver(()=>{
+        if (ensureMenu()) obs.disconnect();
+      });
+      obs.observe(hand, {childList:true, subtree:true});
+    }
+  });
+
+})();
+</script>
+<!-- ====== 覆蓋檔結束 ====== -->
+
+
+<!-- ====== 🖐 子選單：擴充 API 開始 ====== -->
+<script>
+(() => {
+  'use strict';
+
+  function getHandAndMenu(){
+    const controls = document.getElementById('controls');
+    if(!controls) return {};
+    const hand =
+      controls.querySelector('#btn-hand') ||
+      controls.querySelector('[data-action="hand"]') ||
+      Array.from(controls.querySelectorAll('.key,div,button'))
+           .find(el => (el.textContent||'').includes('🖐'));
+    const menu = hand && hand.querySelector('.hand-menu');
+    return { hand, menu };
+  }
+
+  window.DD = window.DD || {};
+  const REG = window.DD._handActions = window.DD._handActions || new Map();
+
+  function rerender(){
+    const { menu } = getHandAndMenu();
+    if(!menu) return;
+    menu.innerHTML = '';
+
+    const items = Array.from(REG.values())
+      .filter(x => (typeof x.visible==='function' ? !!x.visible() : x.visible!==false))
+      .sort((a,b) => (a.order||100) - (b.order||100));
+
+    items.forEach((item) => {
+      if (item.type === 'separator') {
+        const hr = document.createElement('div');
+        hr.style.cssText = 'height:1px;background:rgba(255,255,255,.12);margin:4px 0';
+        menu.appendChild(hr);
+        return;
+      }
+
+      const btn = document.createElement('div');
+      btn.style.cssText = 'width:40px;height:40px;border-radius:10px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;user-select:none;cursor:pointer;';
+      btn.title = item.title || item.label || item.id || '';
+      btn.textContent = item.icon || '•'; // 只顯示圖示
+
+      const disabled = (typeof item.disabled==='function') ? !!item.disabled() : !!item.disabled;
+      if(disabled){ btn.style.opacity = .5; btn.style.cursor = 'not-allowed'; }
+
+      function hideMenu(){
+        menu.style.display = 'none';
+        const hand = menu.parentElement;
+        if(hand) hand._handMenuOpen = false;
+      }
+      const fire = (ev)=>{
+        if(disabled) return ev && ev.preventDefault();
+        try{ item.onTrigger && item.onTrigger(ev); }
+        finally{ if(item.autoClose !== false) hideMenu(); }
+      };
+      btn.addEventListener('click', fire, {passive:false});
+      btn.addEventListener('touchend', (e)=>{ fire(e); e.preventDefault(); }, {passive:false});
+
+      menu.appendChild(btn);
+    });
+  }
+
+  window.DD.registerHandAction = function(action){
+    if(!action || !action.id) throw new Error('registerHandAction 需要唯一 id');
+    REG.set(action.id, action); rerender();
+  };
+  window.DD.unregisterHandAction = function(id){ REG.delete(id); rerender(); };
+  window.DD.refreshHandMenu = rerender;
+
+  // 預設註冊 🎺 與 🥩
+  if(!REG.has('flute')){
+    window.DD.registerHandAction({ id:'flute', icon:'🎺', title:'吹笛（派送 dd:flute）', order:10,
+      onTrigger(){ window.dispatchEvent(new CustomEvent('dd:flute')); } });
+  }
+  if(!REG.has('sep-1')) window.DD.registerHandAction({ id:'sep-1', type:'separator', order:49 });
+  if(!REG.has('tame')){
+    window.DD.registerHandAction({ id:'tame', icon:'🥩', title:'馴養（派送 dd:tame + KeyF）', order:50,
+      onTrigger(){
+        window.dispatchEvent(new CustomEvent('dd:tame',{detail:{source:'hand-menu'}}));
+        const evDown = new KeyboardEvent('keydown',{code:'KeyF',key:'KeyF',bubbles:true});
+        const evUp   = new KeyboardEvent('keyup',{code:'KeyF',key:'KeyF',bubbles:true});
+        window.dispatchEvent(evDown); setTimeout(()=>window.dispatchEvent(evUp),20);
+      }
+    });
+  }
+
+  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', rerender); }
+  else{ rerender(); }
+})();
+</script>
+<!-- ====== 🖐 子選單：擴充 API 結束 ====== -->
+
+
+<!-- B) 外掛：MELEE8（只送 dd:slash；不自畫） + 手機🔪按鈕 -->
+<script>
+(() => {
+  'use strict';
+
+  // 方向（鍵盤/手機都會更新）
+  const DIR = (window.__attackDir ||= {x:1,y:0});
+
+  // 世界 tileSize（比例）
+  const SAVEK='dd_skel_phase1';
+  let T = 48;
+  try{ const d=JSON.parse(localStorage.getItem(SAVEK)||'{}'); T = d.tileSize||48; }catch{}
+
+  // 出刀參數（不含任何繪製）
+  const cfg = { damage: 10, cooldown: 0.24, life: 0.18 };
+  let cd = 0;
+
+  function ensurePlayer(){ return (typeof window.__ensurePlayer==='function') ? window.__ensurePlayer() : null; }
+  function isPlay(){ return (typeof window.__getMode==='function') ? window.__getMode()==='play' : true; }
+
+  // 出刀（J）
+  addEventListener('keydown', (e)=>{
+    if(e.code!=='KeyJ') return;
+    if(!isPlay()) return;
+    if(cd>0) return;
+
+    const p = ensurePlayer(); if(!p) return;
+
+    // 方向：沒輸入就用面向
+    let dx = DIR.x, dy = DIR.y;
+    if(Math.abs(dx)+Math.abs(dy) < 0.0001){
+      const f = (typeof p.face==='number'?p.face:1);
+      dx = f>=0?1:-1; dy = 0;
+    }
+    const len = Math.hypot(dx,dy)||1; dx/=len; dy/=len;
+
+    // 讓刀光貼身：半徑與偏移依角色尺寸
+    const body = Math.max(p.w, p.h);
+    const r   = Math.max(14, body * 0.46);
+    const off = Math.max(10, body * 0.52);
+    const cx = p.x + p.w/2 + dx*off;
+    const cy = p.y + p.h/2 + dy*off;
+
+    // 只送「一次」華麗刀光事件（帶武器外觀）
+    const weapon = (window.WEAPON && WEAPON.get && WEAPON.get()) ||
+                   { blade:'#ffd34e', edge:'#fff', trail:'rgba(255,220,120,0.35)', len:48, width:9 };
+
+    window.dispatchEvent(new CustomEvent('dd:slash', {
+      detail: { cx, cy, dx, dy, r, dur: cfg.life, swing:'topdown', weapon }
+    }));
+
+    // 傷害交給 DD_HITBOX
+    window.dispatchEvent(new CustomEvent('dd:attack', {
+      detail:{ shape:'circle', cx, cy, r, atk:cfg.damage, team:'player', dir:[dx,dy], meta:{kind:'melee'} }
+    }));
+
+    cd = cfg.cooldown;
+  });
+
+  // 簡單冷卻計時
+  (function loop(){ if(cd>0) cd=Math.max(0, cd-1/60); requestAnimationFrame(loop); })();
+
+  // ===== 手機🔪按鈕（拖移改方向；點一下出刀） =====
+  function sendKey(code, type){
+    const ev = new KeyboardEvent(type, { code, key: code, bubbles: true });
+    window.dispatchEvent(ev);
+  }
+  function injectKnifeButton(){
+    if(document.getElementById('btn-knife')) return;
+    const controls = document.getElementById('controls'); if(!controls) return;
+
+    let right = controls.querySelector('.cluster.right');
+    if(!right){
+      right = document.createElement('div');
+      right.className = 'cluster right';
+      right.style.cssText = 'position:absolute;right:12px;bottom:12px;display:flex;gap:10px;align-items:flex-end;flex-direction:column';
+      controls.appendChild(right);
+    }
+
+    const base = document.createElement('div');
+    base.id = 'btn-knife';
+    base.style.cssText = `
+      width:64px;height:64px;border-radius:999px;
+      background:rgba(255,255,255,.10);
+      border:1px solid rgba(255,255,255,.18);
+      position:relative; pointer-events:auto; user-select:none;
+      touch-action:none; display:flex;align-items:center;justify-content:center;
+      font-size:28px; line-height:1; backdrop-filter:blur(4px);
+    `;
+    base.textContent = '🔪';
+    // 把🔪插在🖐下面；找不到🖐就加在最後
+const handBtn =
+  right.querySelector('#btn-hand') ||
+  right.querySelector('[data-action="hand"]') ||
+  Array.from(right.querySelectorAll('.key,div,button'))
+       .find(el => (el.textContent||'').includes('🖐'));
+
+if (handBtn && handBtn.parentElement === right) {
+  right.insertBefore(base, handBtn.nextSibling);
+} else {
+  right.appendChild(base);
+}
+
+    const R=28, TAP=12; let dragging=false, moved=0;
+    function setDir(dx,dy){ const l=Math.hypot(dx,dy); if(l>=4){ DIR.x=dx/l; DIR.y=dy/l; } }
+    function P(ev){ if(ev.touches&&ev.touches[0]) return {x:ev.touches[0].clientX,y:ev.touches[0].clientY}; return {x:ev.clientX,y:ev.clientY}; }
+    function onDown(e){ dragging=true; moved=0; base.style.boxShadow='0 0 0 6px rgba(255,255,255,0.10)'; e.preventDefault(); }
+    function onMove(e){
+      if(!dragging) return;
+      const p=P(e), rc=base.getBoundingClientRect();
+      const dx=p.x-(rc.left+rc.width/2), dy=p.y-(rc.top+rc.height/2);
+      moved=Math.max(moved, Math.hypot(dx,dy));
+      const l=Math.hypot(dx,dy)||1, k=Math.min(1,R/l);
+      base.style.transform=`translate(${dx*k*0.2}px, ${dy*k*0.2}px)`; // 視覺微動
+      setDir(dx,dy);
+      e.preventDefault();
+    }
+    function onUp(e){
+      if(!dragging) return;
+      dragging=false;
+      base.style.boxShadow='0 0 0 0 rgba(255,255,255,0)';
+      base.style.transform='translate(0,0)';
+      if(moved<TAP){ sendKey('KeyJ','keydown'); setTimeout(()=>sendKey('KeyJ','keyup'),30); }
+      e.preventDefault();
+    }
+    base.addEventListener('touchstart', onDown, {passive:false});
+    base.addEventListener('touchmove',  onMove,  {passive:false});
+    base.addEventListener('touchend',   onUp,    {passive:false});
+    base.addEventListener('touchcancel',onUp,    {passive:false});
+    base.addEventListener('pointerdown',onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup',   onUp);
+    window.addEventListener('blur',        onUp);
+  }
+  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', injectKnifeButton); } else { injectKnifeButton(); }
+})();
+</script>
+
+//🔪攻擊按鈕結束
+
+//刀光開始
+<!-- C) 外掛：武士刀揮砍（細長版） -->
+<script>
+(() => {
+  'use strict';
+
+  const slashes = [];
+
+  // ====== 細長武士刀樣式 ======
+  const KATANA = {
+    blade: '#eaf0f9',
+    edge:  '#ffffff',
+    trail: 'rgba(150,200,255,0.35)',
+    len:   96,   // 刀長（細長 → 拉長）
+    width: 6     // 基礎刀寬（更細）
+  };
+
+  const STYLE = {
+    segs: 18,                         // 更細分段
+    width: t => 1 - 0.8*t,            // taper 更劇烈，尾端極細
+    fade:  t => 1 - t*t,
+    rotEase: t => 1 - (1-t)*(1-t),
+    curveAmt: 0.30,                   // 微彎度
+    sideFlipByFacing: true,
+    trailBlend: 'lighter',
+    bladeBlend: 'source-over'
+  };
+
+  window.addEventListener('dd:slash', (ev) => {
+    const d = ev.detail || {};
+    const weapon = Object.assign({}, KATANA, d.weapon || {});
+    slashes.push({
+      cx: d.cx|0, cy: d.cy|0,
+      dx: d.dx||1, dy: d.dy||0,
+      ang0: Math.atan2(d.dy||0, d.dx||1),
+      r: d.r || 60,
+      life: 0,
+      max: (+d.dur>0 ? +d.dur : 0.20),
+      weapon
+    });
+  });
+
+  let _last = performance.now();
+  function tick(now){
+    const dt = Math.min(0.033,(now-_last)/1000); _last=now;
+    for(let i=slashes.length-1;i>=0;i--){
+      slashes[i].life+=dt;
+      if(slashes[i].life>=slashes[i].max) slashes.splice(i,1);
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  function sampleCubic(p0,p1,p2,p3,t){
+    const u=1-t;
+    const x=u*u*u*p0.x+3*u*u*t*p1.x+3*u*t*t*p2.x+t*t*t*p3.x;
+    const y=u*u*u*p0.y+3*u*u*t*p1.y+3*u*t*t*p2.y+t*t*t*p3.y;
+    const dx=3*u*u*(p1.x-p0.x)+6*u*t*(p2.x-p1.x)+3*t*t*(p3.x-p2.x);
+    const dy=3*u*u*(p1.y-p0.y)+6*u*t*(p2.y-p1.y)+3*t*t*(p3.y-p2.y);
+    return {x,y,dx,dy};
+  }
+  function buildCurve(s,tNorm){
+    const {cx,cy,ang0,r}=s;
+    const extra=Math.PI*0.5*(1-STYLE.rotEase(tNorm));
+    const ang=ang0+extra;
+    const fwd={x:Math.cos(ang),y:Math.sin(ang)};
+    const side={x:-fwd.y,y:fwd.x};
+    const flip=STYLE.sideFlipByFacing?Math.sign(Math.cos(s.ang0)||1):1;
+    const sway=STYLE.curveAmt*flip;
+    const p0={x:cx+fwd.x*(r*0.05),y:cy+fwd.y*(r*0.05)};
+    const p3={x:cx+fwd.x*(r*0.98),y:cy+fwd.y*(r*0.98)};
+    const sideStrength=r*0.28;
+    const p1={x:cx+fwd.x*(r*0.33)+side.x*(sideStrength*sway),
+              y:cy+fwd.y*(r*0.33)+side.y*(sideStrength*sway)};
+    const p2={x:cx+fwd.x*(r*0.66)+side.x*(sideStrength*-sway),
+              y:cy+fwd.y*(r*0.66)+side.y*(sideStrength*-sway)};
+    return {p0,p1,p2,p3};
+  }
+  function extrudeRibbon(curve,segs,baseW,widthFn){
+    const L=[],R=[];
+    for(let i=0;i<=segs;i++){
+      const t=i/segs, pt=sampleCubic(curve.p0,curve.p1,curve.p2,curve.p3,t);
+      const v=Math.hypot(pt.dx,pt.dy)||1, nx=-pt.dy/v, ny=pt.dx/v;
+      const w=baseW*(widthFn?widthFn(t):(1-0.65*t));
+      L.push({x:pt.x+nx*w,y:pt.y+ny*w});
+      R.push({x:pt.x-nx*w,y:pt.y-ny*w});
+    }
+    return {left:L,right:R};
+  }
+  function fillRibbon(ctx,L,R){
+    ctx.beginPath();
+    ctx.moveTo(L[0].x,L[0].y);
+    for(let i=1;i<L.length;i++) ctx.lineTo(L[i].x,L[i].y);
+    for(let i=R.length-1;i>=0;i--) ctx.lineTo(R[i].x,R[i].y);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function draw(ctx){
+    for(const s of slashes){
+      const k=Math.min(1,s.life/s.max);
+      const fade=STYLE.fade(k);
+      const theme=s.weapon;
+
+      const curve=buildCurve(s,k);
+      const rib=extrudeRibbon(curve,STYLE.segs,theme.width,STYLE.width);
+
+      // Trail
+      ctx.save();
+      ctx.globalCompositeOperation=STYLE.trailBlend;
+      ctx.globalAlpha=0.25+0.30*fade;
+      const g=ctx.createRadialGradient(s.cx,s.cy,(theme.len||96)*0.08,s.cx,s.cy,s.r);
+      g.addColorStop(0.00,'rgba(230,240,255,0.85)');
+      g.addColorStop(0.35,theme.trail);
+      g.addColorStop(1.00,'rgba(180,220,255,0.0)');
+      ctx.fillStyle=g;
+      fillRibbon(ctx,rib.left,rib.right);
+      ctx.restore();
+
+      // Blade
+      ctx.save();
+      ctx.globalCompositeOperation=STYLE.bladeBlend;
+      ctx.globalAlpha=0.97;
+      ctx.fillStyle=theme.blade;
+      fillRibbon(ctx,rib.left,rib.right);
+
+      // 單側亮刃
+      ctx.globalAlpha=0.8;
+      ctx.strokeStyle=theme.edge;
+      ctx.lineWidth=1.2;
+      ctx.beginPath();
+      ctx.moveTo(rib.left[0].x,rib.left[0].y);
+      for(let i=1;i<rib.left.length;i++) ctx.lineTo(rib.left[i].x,rib.left[i].y);
+      ctx.stroke();
+
+      // 刀尖光
+      const tipL=rib.left[rib.left.length-1];
+      const tipR=rib.right[rib.right.length-1];
+      const tipX=(tipL.x+tipR.x)/2, tipY=(tipL.y+tipR.y)/2;
+      ctx.globalAlpha=0.85*fade;
+      const glow=ctx.createRadialGradient(tipX,tipY,0,tipX,tipY,Math.max(10,theme.width*3));
+      glow.addColorStop(0,'rgba(255,255,255,0.95)');
+      glow.addColorStop(1,'rgba(200,230,255,0.0)');
+      ctx.fillStyle=glow;
+      ctx.beginPath(); ctx.arc(tipX,tipY,Math.max(8,theme.width*2),0,Math.PI*2); ctx.fill();
+
+      ctx.restore();
+    }
+  }
+
+  window.__drawCombat=draw;
+})();
+</script>
+//刀光結束
+
+
+
+<script>
+/* ===== Tile 外掛 API（一次性橋接）======================================
+   功能：
+   - TILES.add({ key, label, solid, draw, onEnter, onStay, onExit, meta })
+   - 自動把 tile 放到「建築」分類的調色盤（可直接放置到地圖）
+   - __tileIsSolid：讓核心碰撞邏輯認得外掛 tile 的實心與否
+   - __drawUnknownTile：讓核心渲染未知字元時，交給外掛的 draw
+   - 自動偵測玩家站在哪格 → 觸發 onEnter/onStay/onExit（不改核心）
+   ====================================================================== */
+(()=> {
+  // ---- 設備檢查 ----
+  const SAVE_KEY = 'dd_skel_phase1';
+  // 1) 全域外掛容器
+  const TILES = (window.TILES ||= {
+    meta:new Map(),           // key -> {solid, draw, ...}
+    hooks:{                   // key -> { onEnter,onStay,onExit }
+      onEnter:new Map(), onStay:new Map(), onExit:new Map()
+    },
+    add(def){
+      const {key,label,solid=false,draw,onEnter,onStay,onExit,meta} = def||{};
+      if (!key) return;
+      // 註冊到 palette（建築）
+      const TT = (window.TILE_TYPES ||= { building:[] });
+      if (!TT.building.some(t=>t.val===key)) {
+        TT.building.push({ label: label||key, val:key, solid:!!solid });
+      }
+      // 紀錄行為/繪圖
+      TILES.meta.set(key, { solid: !!solid, draw, ...(meta||{}) });
+      if (onEnter) TILES.hooks.onEnter.set(key,onEnter);
+      if (onStay ) TILES.hooks.onStay .set(key,onStay);
+      if (onExit ) TILES.hooks.onExit .set(key,onExit);
+      // 如果 palette 已經在「建築」分類頁面，重新渲染一次
+      try {
+        const pill = document.querySelector('#palette .pill[data-cat="building"]');
+        if (pill && pill.classList.contains('active') && typeof window.__renderCategory==='function'){
+          window.__renderCategory('building');
+        }
+      } catch {}
+    }
+  });
+  window.TILES = TILES;
+
+  // 2) 讓核心可問我們：這個字元是不是實心？
+  window.__tileIsSolid = function(ch){
+    const m = TILES.meta.get(ch);
+    if (!m) return (ch==='#'); // 核心的 fallback
+    return !!m.solid;
+  };
+
+  // 3) 讓核心在遇到未知字元時委託我們畫
+  window.__drawUnknownTile = function(ctx, ch, px, py, TILE){
+    const m = TILES.meta.get(ch);
+    if (m && typeof m.draw === 'function'){
+      m.draw(ctx, px, py, TILE, ch);
+      return true;
+    }
+    return false;
+  };
+
+  // 4) 我們自己讀「影子地圖」快照（不動核心）
+  let _rawCache = null, world = null;
+  function loadWorldSnapshot(force=false){
+    const raw = localStorage.getItem(SAVE_KEY) || '';
+    if (!force && raw===_rawCache) return world;
+    _rawCache = raw;
+    try{
+      const d = JSON.parse(raw||'{}');
+      world = {
+        w: d.w||40, h:d.h||24,
+        tileSize: d.tileSize||48,
+        tiles: (d.tileRows||[]).map(r=>r.split('')),
+        start: d.start || {x:2,y:(d.h||24)-6}
+      };
+    }catch{ world = { w:40,h:24,tileSize:48, tiles:[], start:{x:2,y:18} }; }
+    return world;
+  }
+  function tileAtGX(gx,gy){
+    if(!world) return '.';
+    if (gx<0||gy<0||gx>=world.w||gy>=world.h) return '#';
+    const row = world.tiles[gy]||[];
+    return row[gx]||'.';
+  }
+
+  // 5) 追蹤玩家在哪一格 → 觸發 tile hooks（enter/stay/exit）
+  const INPUT = { jump:false }; // 提供外掛讀取（例：水中按住跳上浮）
+  addEventListener('keydown', e=>{
+    if (window.__getMode && window.__getMode()!=='play') return;
+    if (e.code==='Space' || e.code==='ArrowUp' || e.code==='KeyW') INPUT.jump = true;
+  });
+  addEventListener('keyup', e=>{
+    if (e.code==='Space' || e.code==='ArrowUp' || e.code==='KeyW') INPUT.jump = false;
+  });
+  window.__INPUT = INPUT; // 外掛可選讀
+
+  let lastKey = null; // 上一幀所在 tile key
+  let _lastTs = 0;
+  function loop(ts){
+    const dt = Math.min(0.033, _lastTs ? (ts - _lastTs)/1000 : 0); _lastTs = ts;
+    try{
+      if (window.__getMode && window.__getMode()==='play'){
+        loadWorldSnapshot(); // 地圖可能在編輯時被改
+        const p = (window.__ensurePlayer && window.__ensurePlayer());
+        if (p && world){
+          const T = world.tileSize;
+          const gx = Math.floor((p.x + p.w/2)/T);
+          const gy = Math.floor((p.y + p.h/2)/T);
+          const key = tileAtGX(gx,gy);
+
+          // enter / exit
+          if (key !== lastKey){
+            const onExit = TILES.hooks.onExit.get(lastKey);
+            if (onExit) try{ onExit({e:p,gx,gy,dt,world,INPUT}); }catch{}
+            const onEnter = TILES.hooks.onEnter.get(key);
+            if (onEnter) try{ onEnter({e:p,gx,gy,dt,world,INPUT}); }catch{}
+            lastKey = key;
+          }
+          // stay
+          const onStay = TILES.hooks.onStay.get(key);
+          if (onStay) try{ onStay({e:p,gx,gy,dt,world,INPUT}); }catch{}
+        }
+      } else {
+        lastKey = null; // 回到編輯時重置
+      }
+    }catch{}
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // 6) 提供 palette 重新渲染（可選）
+  window.__renderCategory = function(cat){
+    // 讓 Phase1 的 renderCategory 能被呼叫；若沒有就忽略
+    try{
+      const ev = new Event('click');
+      const pill = document.querySelector(`#palette .pill[data-cat="${cat}"]`);
+      if (pill) pill.dispatchEvent(ev);
+    }catch{}
+  };
+})();
+</script>
+//TILE API 結束
+
+
+
+
+//地形插件開始
+
+<script>
+/* =========================
+   水外掛（~）
+   - 進水：游泳手感（阻尼＋浮力）
+   - 長按「跳躍」：持續上浮（封頂速度避免穿牆）
+   - 出水：噴水花粒子
+   - 畫法：無波紋，僅柔和垂直漸層
+   依賴：
+   - 你已經有 TILES.add / DD_HOOKS 派發器 / __ensurePlayer / __getMode
+   ========================= */
+
+/* ---- 輕量水花 FX：掛到 __drawCombat，與既有效果共存 ---- */
+(function setupWaterFX(){
+  if (window.__WATER_FX_PATCHED) return;        // 防重複
+  window.__WATER_FX_PATCHED = true;
+
+  const FX = (window.WATER_FX ||= []);
+  let prevDraw = window.__drawCombat;
+  let last = performance.now();
+
+  function spawnSplash(x, y, vyBoost = 0){
+    const n = 12 + Math.floor(Math.random()*10);
+    for (let i=0; i<n; i++){
+      FX.push({
+        x, y,
+        vx: (Math.random()*280 - 140),
+        vy: (-260 - Math.random()*220) - vyBoost*0.15,
+        r: 1.8 + Math.random()*2.2,
+        t: 0,
+        life: 0.55 + Math.random()*0.25
+      });
+    }
+  }
+  window.WATER_FX_spawn = spawnSplash;
+
+  window.__drawCombat = function(ctx){
+    if (typeof prevDraw === 'function') prevDraw(ctx);
+
+    const now = performance.now();
+    const dt = Math.min(0.033, (now - last)/1000);
+    last = now;
+
+    for (let i=FX.length-1; i>=0; i--){
+      const p = FX[i];
+      p.t += dt;
+      p.x += p.vx*dt;
+      p.y += p.vy*dt;
+      p.vy += 1400*dt;     // 重力
+
+      const a = Math.max(0, 1 - p.t/p.life);
+      if (a <= 0){ FX.splice(i,1); continue; }
+
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fillStyle = '#8fd3ff';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  };
+})();
+
+/* ---- 水 tile 本體 ---- */
+TILES.add({
+  key: '~',
+  label: '~ 水（可游泳）',
+  solid: false,
+  meta: { isWater: true },
+
+  // 無波紋畫法：柔和垂直漸層
+  draw(ctx, x, y, T){
+    const g = ctx.createLinearGradient(0, y, 0, y+T);
+    g.addColorStop(0.00, '#6ecbff');
+    g.addColorStop(1.00, '#1c5b9a');
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y, T, T);
+  },
+
+  onEnter({ e, gy }) {
+    e._inWater = true;
+    e._lastWaterGy = gy;         // 紀錄水面列，用於出水時定位
+  },
+
+  onExit({ e, gx, gy, world }) {
+    // 往上離開水面才噴水花（vy < -40）
+    if (e._inWater && e.vy < -40 && world?.tileSize){
+      const T = world.tileSize;
+      const waterGy = (e._lastWaterGy != null ? e._lastWaterGy : (gy+1));
+      const surfaceY = waterGy * T;           // 水格頂邊當作水面
+      const cx = e.x + e.w/2;
+      if (typeof window.WATER_FX_spawn === 'function'){
+        window.WATER_FX_spawn(cx, surfaceY, -e.vy);
+      }
+    }
+    e._inWater = false;
+    e._lastWaterGy = null;
+  },
+
+  onStay({ e, dt, INPUT, gy }) {
+    // 標記持續在水中
+    e._inWater = true;
+    e._lastWaterGy = gy;
+
+    // 基礎游泳手感：阻尼 + 浮力
+    e.vx *= 0.92;        // 水中水平阻尼
+    e.vy *= 0.82;        // 垂直阻尼
+    e.vy -= 320 * dt;    // 基礎浮力（不按鍵也會慢慢上浮）
+
+    // 長按「跳躍」→ 顯著上浮；封頂避免穿牆
+    if (INPUT?.jump){
+      const maxUp = -800;     // 上浮最大速度（負值＝往上）
+      e.vy -= 6500 * dt;       // 額外上浮力
+      if (e.vy < maxUp) e.vy = maxUp;
+    }
+
+    // 在水中不視為著地，避免陸上跳邏輯干擾
+    e.onGround = false;
+  }
+});
+</script>
+
+
+
+
+
+//地形插件結束
+
+
+
+
+
